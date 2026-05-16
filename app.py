@@ -196,7 +196,6 @@ def call_gemini_consultant(api_key: str, negative_reviews: list[str]) -> str:
     `gemini-2.5-flash`.
     """
     from google import genai
-
     client = genai.Client(api_key=api_key)
 
     joined = "\n".join(f"- {r}" for r in negative_reviews if str(r).strip())
@@ -489,7 +488,7 @@ def collect_negative_samples() -> Tuple[list[str], str]:
         ]
         if len(neg_texts) == 0:
             return [], "user_all_positive"
-        return random.sample(neg_texts, k=min(10, len(neg_texts))), "your uploaded data"
+        return random.sample(neg_texts, min(10, len(neg_texts))), "your uploaded data"
 
     base_neg = [t for t in base.get("base_negative_samples", []) if str(t).strip()]
     if len(base_neg) == 0:

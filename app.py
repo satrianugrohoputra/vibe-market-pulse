@@ -2,7 +2,7 @@
 Hybrid E-Commerce Sentiment Analyzer
 ====================================
 A Streamlit app that combines a Traditional NLP ML pipeline (TF-IDF + Logistic
-Regression) with Generative AI (Gemini 1.5 Pro) for executive-level insights
+Regression) with Generative AI (Gemini 2.5 flash) for executive-level insights
 on e-commerce review datasets.
 
 Base dataset columns (Women's E-Commerce Clothing Reviews):
@@ -186,14 +186,11 @@ def get_gemini_api_key() -> Tuple[Optional[str], Optional[str]]:
 
 
 def call_gemini_consultant(api_key: str, negative_reviews: list[str]) -> str:
-    """Send negative reviews to Gemini and return markdown response.
-
-    Uses the new `google-genai` SDK (package: google-genai) with model
-    `gemini-2.0-flash` which is the current stable, widely-available model.
-    Falls back to `gemini-1.5-flash` if 2.0 is unavailable.
+    """
+    Send negative reviews to Gemini and return markdown response.
+    Uses the new google-genai SDK with model gemini-2.5-flash.
     """
     from google import genai
-
     client = genai.Client(api_key=api_key)
 
     joined = "\n".join(f"- {r}" for r in negative_reviews if str(r).strip())
@@ -211,7 +208,7 @@ def call_gemini_consultant(api_key: str, negative_reviews: list[str]) -> str:
     )
 
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash",
         contents=prompt,
     )
     return response.text
@@ -224,7 +221,7 @@ def call_gemini_consultant(api_key: str, negative_reviews: list[str]) -> str:
 st.title("🛍️ Hybrid E-Commerce Sentiment Analyzer")
 st.caption(
     "Traditional ML (TF-IDF + Logistic Regression) **+** Generative AI "
-    "(Gemini 1.5 Pro) for actionable business insights."
+    "(Gemini 2.5 flash) for actionable business insights."
 )
 
 # --- Train Base Model ---
@@ -262,7 +259,7 @@ with st.sidebar:
         "**Tech Stack**\n"
         "- scikit-learn (TF-IDF + LogReg)\n"
         "- Pandas / Plotly\n"
-        "- Google Generative AI (Gemini 1.5 Pro)"
+        "- Google Generative AI (Gemini 2.5 flash)"
     )
 
 # --- Model Performance ---
@@ -369,7 +366,7 @@ else:
 st.divider()
 
 # --- Gemini AI Consultant ---
-st.subheader("🤖 Ask AI Consultant (Gemini 1.5 Pro)")
+st.subheader("🤖 Ask AI Consultant (Gemini 2.5 flash)")
 st.markdown(
     "Generate an executive summary of customer pain points from negative reviews "
     "(`Recommended IND == 0`)."
@@ -397,7 +394,7 @@ def collect_negative_samples() -> Tuple[list[str], str]:
         if len(neg_texts) == 0:
             # User uploaded data is 100% positive — no negatives to sample
             return [], "user_all_positive"
-        return random.sample(neg_texts, k=min(10, len(neg_texts))), "your uploaded data"
+        return random.sample(neg_texts, min(10, len(neg_texts))), "your uploaded data"
 
     # Fallback: base dataset negatives
     base_neg = [t for t in base.get("base_negative_samples", []) if str(t).strip()]
@@ -427,7 +424,7 @@ if trigger:
             with st.expander(f"📝 Reviews sent to Gemini ({source})", expanded=False):
                 for i, s in enumerate(samples, 1):
                     st.markdown(f"{i}. {s}")
-            with st.spinner("Consulting Gemini 1.5 Pro..."):
+            with st.spinner("Consulting Gemini 2.5 flash..."):
                 try:
                     output = call_gemini_consultant(api_key, samples)
                 except Exception as exc:

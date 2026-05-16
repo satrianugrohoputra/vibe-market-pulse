@@ -190,7 +190,7 @@ def call_gemini_consultant(api_key: str, negative_reviews: list[str]) -> str:
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-pro")
+    model = genai.GenerativeModel("gemini-pro")
 
     joined = "\n".join(f"- {r}" for r in negative_reviews if str(r).strip())
 
@@ -390,7 +390,7 @@ def collect_negative_samples() -> Tuple[list[str], str]:
         if len(neg_texts) == 0:
             # User uploaded data is 100% positive — no negatives to sample
             return [], "user_all_positive"
-        return random.sample(neg_texts, k=min(10, len(neg_texts))), "your uploaded data"
+        return random.sample(neg_texts, min(10, len(neg_texts))), "your uploaded data"
 
     # Fallback: base dataset negatives
     base_neg = [t for t in base.get("base_negative_samples", []) if str(t).strip()]

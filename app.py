@@ -16,6 +16,7 @@ import io
 import random
 from typing import Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -32,15 +33,10 @@ BASE_DATASET_PATH = "ecommercereviews.csv"
 TEXT_COL = "Review Text"
 TARGET_COL = "Recommended IND"
 
-# Numeric label conventions for "Recommended IND"
 NEGATIVE_LABEL = 0  # not recommended
 POSITIVE_LABEL = 1  # recommended
 
-# Friendly display names for the two classes
-LABEL_DISPLAY = {
-    NEGATIVE_LABEL: "Negative",
-    POSITIVE_LABEL: "Positive",
-}
+LABEL_MAP = {0: "Negative", 1: "Positive"}
 
 # ----------------------------------------------------------------------------
 # Page Config
@@ -54,108 +50,55 @@ st.set_page_config(
 
 
 # ----------------------------------------------------------------------------
-# Data cleaning helpers
-# ----------------------------------------------------------------------------
-def clean_review_dataframe(
-    df: pd.DataFrame,
-    text_col: str = TEXT_COL,
-    target_col: Optional[str] = TARGET_COL,
-) -> pd.DataFrame:
-    """
-    Clean a reviews dataframe so it is safe to feed into TfidfVectorizer.
-
-    Rules:
-      * Drop rows where the target column is NaN (only when target_col is given).
-      * Fill NaN in the text column with empty string ('').
-      * Coerce the target column to int (0 / 1).
-    """
-    out = df.copy()
-
-    if target_col is not None and target_col in out.columns:
-        # Drop rows where the target/label is missing - these are unusable for
-        # supervised training.
-        out = out.dropna(subset=[target_col])
-        # Force numeric, drop anything that won't coerce, then cast to int.
-        out[target_col] = pd.to_numeric(out[target_col], errors="coerce")
-        out = out.dropna(subset=[target_col])
-        out[target_col] = out[target_col].astype(int)
-
-    if text_col in out.columns:
-        # CRITICAL: TfidfVectorizer will raise AttributeError on NaN in the text
-        # column, so fill with empty string before passing it any text.
-        out[text_col] = out[text_col].fillna("").astype(str)
-
-    return out
-
-
-def find_text_column(df: pd.DataFrame) -> Optional[str]:
-    """
-    Locate a usable review text column on a user-uploaded CSV.
-
-    Priority:
-      1. The exact base column name ("Review Text").
-      2. Common alternates (Review, Text, Comment, ...).
-      3. Fallback: the object column with the longest average string length.
-    """
-    if TEXT_COL in df.columns:
-        return TEXT_COL
-
-    candidates = [
-        "Review Text", "review_text", "Review", "review",
-        "Text", "text", "Reviews", "reviews",
-        "Comment", "comment", "Feedback", "feedback",
-        "Message", "message", "Content", "content", "Body", "body",
-    ]
-    for c in candidates:
-        if c in df.columns:
-            return c
-
-    object_cols = df.select_dtypes(include="object").columns.tolist()
-    if not object_cols:
-        return None
-    avg_lengths = {c: df[c].fillna("").astype(str).str.len().mean() for c in object_cols}
-    return max(avg_lengths, key=avg_lengths.get) if avg_lengths else None
-
-
-# ----------------------------------------------------------------------------
 # Cached: Train Base ML Pipeline
 # ----------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Training base sentiment model...")
 def train_base_pipeline() -> dict:
     """
-    Loads the base ecommercereviews.csv, trains a TF-IDF + Logistic Regression
-    pipeline (80/20 split) on `Review Text` -> `Recommended IND`, and returns
-    the trained pipeline plus evaluation artifacts.
+    Loads the base CSV, cleans NaN values, trains a TF-IDF + Logistic Regression
+    pipeline (80/20 split) and returns the trained pipeline plus evaluation info.
     """
+    # --- Load ---
     df = pd.read_csv(BASE_DATASET_PATH)
 
-    # Validate the expected columns exist
-    missing = [c for c in (TEXT_COL, TARGET_COL) if c not in df.columns]
-    if missing:
+    # --- Validate columns exist ---
+    if TEXT_COL not in df.columns:
         raise ValueError(
-            f"Base dataset is missing required column(s) {missing}. "
-            f"Found: {list(df.columns)}"
+            f"Column '{TEXT_COL}' not found. Available: {list(df.columns)}"
+        )
+    if TARGET_COL not in df.columns:
+        raise ValueError(
+            f"Column '{TARGET_COL}' not found. Available: {list(df.columns)}"
         )
 
-    # CRITICAL data cleaning: drop NaN labels, fill NaN text with ''.
-    df = clean_review_dataframe(df, text_col=TEXT_COL, target_col=TARGET_COL)
+    # --- CRITICAL: Handle missing values ---
+    # 1. Drop rows where target (Recommended IND) is NaN
+    df = df.dropna(subset=[TARGET_COL])
 
-    # Keep only rows that are valid for our binary classification.
-    df = df[df[TARGET_COL].isin([NEGATIVE_LABEL, POSITIVE_LABEL])]
+    # 2. Fill NaN in Review Text with empty string (prevents AttributeError
+    #    in TfidfVectorizer which calls .lower() on each element)
+    df[TEXT_COL] = df[TEXT_COL].fillna("")
 
-    if df.empty:
-        raise ValueError("No usable rows after cleaning the base dataset.")
+    # 3. Ensure correct dtypes
+    df[TARGET_COL] = df[TARGET_COL].astype(int)
+    df[TEXT_COL] = df[TEXT_COL].astype(str)
 
-    X = df[TEXT_COL].values
-    y = df[TARGET_COL].values
+    # 4. Keep only valid binary labels
+    df = df[df[TARGET_COL].isin([0, 1])].reset_index(drop=True)
 
-    # Stratify only when both classes have at least 2 samples.
-    stratify = y if pd.Series(y).value_counts().min() >= 2 else None
+    if len(df) == 0:
+        raise ValueError("No usable rows after cleaning.")
 
+    # --- Prepare arrays (convert to Python lists to avoid numpy indexing issues) ---
+    X = df[TEXT_COL].tolist()
+    y = df[TARGET_COL].tolist()
+
+    # --- Train/Test Split ---
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=stratify,
+        X, y, test_size=0.20, random_state=42, stratify=y,
     )
 
+    # --- Build & Train Pipeline ---
     pipeline = Pipeline([
         ("tfidf", TfidfVectorizer(
             ngram_range=(1, 2),
@@ -173,28 +116,28 @@ def train_base_pipeline() -> dict:
     ])
 
     pipeline.fit(X_train, y_train)
+
+    # --- Evaluate ---
     y_pred = pipeline.predict(X_test)
 
     accuracy = accuracy_score(y_test, y_pred)
-    target_names = [LABEL_DISPLAY[c] for c in sorted(set(y_test))]
     report = classification_report(
-        y_test, y_pred, target_names=target_names, zero_division=0
+        y_test, y_pred,
+        target_names=["Negative (0)", "Positive (1)"],
+        zero_division=0,
     )
 
-    # Sample of negatives from the held-out test set, used by the AI Consultant
-    # when no user file has been uploaded.
-    test_df = pd.DataFrame({"text": X_test, "actual": y_test, "predicted": y_pred})
-    base_negatives = test_df.loc[
-        test_df["predicted"] == NEGATIVE_LABEL, "text"
-    ].astype(str).tolist()
+    # --- Collect base negative samples for Gemini fallback ---
+    base_negatives = [
+        X_test[i] for i in range(len(X_test))
+        if y_pred[i] == NEGATIVE_LABEL and str(X_test[i]).strip()
+    ]
 
     return {
         "pipeline": pipeline,
-        "text_col": TEXT_COL,
-        "target_col": TARGET_COL,
         "accuracy": accuracy,
         "report": report,
-        "classes": [LABEL_DISPLAY[c] for c in pipeline.classes_],
+        "classes": ["Negative", "Positive"],
         "base_negative_samples": base_negatives,
         "n_train": len(X_train),
         "n_test": len(X_test),
@@ -202,29 +145,48 @@ def train_base_pipeline() -> dict:
 
 
 # ----------------------------------------------------------------------------
+# Helper: find text column in user-uploaded CSV
+# ----------------------------------------------------------------------------
+def find_text_column(df: pd.DataFrame) -> Optional[str]:
+    """Locate a usable text column in a user-uploaded CSV."""
+    candidates = [
+        "Review Text", "review_text", "Review", "review",
+        "Text", "text", "Reviews", "reviews",
+        "Comment", "comment", "Feedback", "feedback",
+        "Message", "message", "Content", "content", "Body", "body",
+    ]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    # Fallback: longest average string column
+    obj_cols = df.select_dtypes(include="object").columns.tolist()
+    if not obj_cols:
+        return None
+    avg_len = {c: df[c].fillna("").astype(str).str.len().mean() for c in obj_cols}
+    return max(avg_len, key=avg_len.get)
+
+
+# ----------------------------------------------------------------------------
 # Gemini Helpers
 # ----------------------------------------------------------------------------
 def get_gemini_api_key() -> Tuple[Optional[str], Optional[str]]:
-    """
-    Securely fetch the Gemini API key from st.secrets.
-    Returns (api_key, error_message). Never raises.
-    """
+    """Securely fetch Gemini API key. Returns (key, error_msg)."""
     try:
         key = st.secrets["GEMINI_API_KEY"]
         if not key or not str(key).strip():
             return None, "GEMINI_API_KEY is empty in your secrets."
-        return str(key), None
+        return str(key).strip(), None
     except (KeyError, FileNotFoundError):
         return None, (
             "GEMINI_API_KEY not configured. Add it to `.streamlit/secrets.toml` "
             "or your deployment secrets to enable the AI Consultant."
         )
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:
         return None, f"Could not read secrets: {exc}"
 
 
 def call_gemini_consultant(api_key: str, negative_reviews: list[str]) -> str:
-    """Send negative reviews to Gemini 1.5 Pro and return the markdown response."""
+    """Send negative reviews to Gemini 1.5 Pro and return markdown response."""
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
@@ -248,45 +210,37 @@ def call_gemini_consultant(api_key: str, negative_reviews: list[str]) -> str:
     return getattr(response, "text", str(response))
 
 
-# ----------------------------------------------------------------------------
-# UI: Header
-# ----------------------------------------------------------------------------
+# ============================================================================
+# UI
+# ============================================================================
+
 st.title("🛍️ Hybrid E-Commerce Sentiment Analyzer")
 st.caption(
     "Traditional ML (TF-IDF + Logistic Regression) **+** Generative AI "
     "(Gemini 1.5 Pro) for actionable business insights."
 )
 
-# ----------------------------------------------------------------------------
-# Train Base Model (always runs, cached)
-# ----------------------------------------------------------------------------
+# --- Train Base Model ---
 try:
     base = train_base_pipeline()
 except FileNotFoundError:
     st.error(
-        f"Base dataset `{BASE_DATASET_PATH}` not found. Please place it in the "
-        "project root before running the app."
+        f"Base dataset `{BASE_DATASET_PATH}` not found. "
+        "Please place it in the project root."
     )
     st.stop()
 except Exception as exc:
     st.error(f"Failed to train base model: {exc}")
     st.stop()
 
-# ----------------------------------------------------------------------------
-# Sidebar
-# ----------------------------------------------------------------------------
+# --- Sidebar ---
 with st.sidebar:
     st.header("📂 Upload New Reviews")
     st.markdown(
-        "Upload a CSV containing a `Review Text` column. "
-        "The trained model will predict whether each review is "
-        "**Positive** (recommended) or **Negative** (not recommended)."
+        "Upload a CSV with a **Review Text** column. "
+        "The trained model will predict Positive or Negative for each review."
     )
-    uploaded_file = st.file_uploader(
-        "Drop a CSV file",
-        type=["csv"],
-        help="Should include a column named 'Review Text' (or similar).",
-    )
+    uploaded_file = st.file_uploader("Drop a CSV file", type=["csv"])
 
     st.divider()
     st.subheader("🔑 Gemini Status")
@@ -304,9 +258,7 @@ with st.sidebar:
         "- Google Generative AI (Gemini 1.5 Pro)"
     )
 
-# ----------------------------------------------------------------------------
-# Section: Base Model Performance
-# ----------------------------------------------------------------------------
+# --- Model Performance ---
 st.subheader("📈 Model Performance (Base Dataset)")
 
 col1, col2, col3, col4 = st.columns(4)
@@ -315,19 +267,16 @@ col2.metric("Train Size", base["n_train"])
 col3.metric("Test Size", base["n_test"])
 col4.metric("Classes", len(base["classes"]))
 
-with st.expander("📋 Classification Report (held-out test set)", expanded=False):
+with st.expander("📋 Classification Report", expanded=False):
     st.code(base["report"], language="text")
     st.caption(
-        f"Text column: **{base['text_col']}** · "
-        f"Target column: **{base['target_col']}** "
-        f"(1 = Positive / Recommended, 0 = Negative / Not Recommended)"
+        f"Text column: **{TEXT_COL}** · "
+        f"Target: **{TARGET_COL}** (1=Positive, 0=Negative)"
     )
 
 st.divider()
 
-# ----------------------------------------------------------------------------
-# Section: User Uploaded Predictions
-# ----------------------------------------------------------------------------
+# --- User Upload & Predictions ---
 st.subheader("🔍 Predict Sentiments on Your Data")
 
 uploaded_df: Optional[pd.DataFrame] = None
@@ -345,29 +294,26 @@ if uploaded_df is not None:
     user_text_col = find_text_column(uploaded_df)
     if user_text_col is None:
         st.error(
-            "Could not detect a text column in your file. Please ensure your "
-            "CSV has a column named `Review Text` (or `Review`, `Text`, `Comment`, ...)."
+            "Could not detect a text column. Ensure your CSV has a column named "
+            "'Review Text', 'Review', 'Text', 'Comment', etc."
         )
     else:
-        # Apply the same cleaning rules used during training, so the
-        # vectorizer never receives NaN.
-        cleaned_df = clean_review_dataframe(
-            uploaded_df, text_col=user_text_col, target_col=None
-        )
+        # Clean: fill NaN text with empty string
+        cleaned_texts = uploaded_df[user_text_col].fillna("").astype(str).tolist()
 
         with st.spinner("Predicting sentiments..."):
-            preds = base["pipeline"].predict(cleaned_df[user_text_col].values)
-            predicted_df = cleaned_df.copy()
+            preds = base["pipeline"].predict(cleaned_texts)
+            predicted_df = uploaded_df.copy()
             predicted_df["Predicted_IND"] = preds
-            predicted_df["Predicted_Sentiment"] = predicted_df["Predicted_IND"].map(
-                LABEL_DISPLAY
-            )
+            predicted_df["Predicted_Sentiment"] = [
+                LABEL_MAP.get(int(p), "Unknown") for p in preds
+            ]
 
         st.success(
             f"Predicted **{len(predicted_df)}** rows using column `{user_text_col}`."
         )
 
-        # Distribution chart
+        # Pie chart
         dist = (
             predicted_df["Predicted_Sentiment"]
             .value_counts()
@@ -379,15 +325,9 @@ if uploaded_df is not None:
         with chart_col:
             st.markdown("**Sentiment Distribution**")
             fig = px.pie(
-                dist,
-                names="Sentiment",
-                values="Count",
-                hole=0.45,
+                dist, names="Sentiment", values="Count", hole=0.45,
                 color="Sentiment",
-                color_discrete_map={
-                    "Positive": "#22c55e",
-                    "Negative": "#ef4444",
-                },
+                color_discrete_map={"Positive": "#22c55e", "Negative": "#ef4444"},
             )
             fig.update_traces(textinfo="percent+label")
             fig.update_layout(showlegend=True, margin=dict(t=10, b=10, l=10, r=10))
@@ -399,92 +339,71 @@ if uploaded_df is not None:
             st.bar_chart(dist.set_index("Sentiment")["Count"])
 
         st.markdown("**First 10 Predictions**")
-        preview_cols = [user_text_col, "Predicted_IND", "Predicted_Sentiment"]
         st.dataframe(
-            predicted_df[preview_cols].head(10),
-            use_container_width=True,
-            hide_index=True,
+            predicted_df[[user_text_col, "Predicted_IND", "Predicted_Sentiment"]].head(10),
+            use_container_width=True, hide_index=True,
         )
 
-        # Download button
-        csv_buffer = io.StringIO()
-        predicted_df.to_csv(csv_buffer, index=False)
+        # Download
+        csv_buf = io.StringIO()
+        predicted_df.to_csv(csv_buf, index=False)
         st.download_button(
             "⬇️ Download Predictions CSV",
-            data=csv_buffer.getvalue(),
+            data=csv_buf.getvalue(),
             file_name="predicted_reviews.csv",
             mime="text/csv",
         )
 else:
     st.info(
-        "👈 Upload a CSV from the sidebar to predict sentiments on your own data. "
-        "If you skip this, the AI Consultant below will analyze the base dataset's "
-        "negative test reviews instead."
+        "👈 Upload a CSV from the sidebar to predict sentiments. "
+        "The AI Consultant below can still analyze the base dataset's negative reviews."
     )
 
 st.divider()
 
-# ----------------------------------------------------------------------------
-# Section: Gemini Executive Summary
-# ----------------------------------------------------------------------------
+# --- Gemini AI Consultant ---
 st.subheader("🤖 Ask AI Consultant (Gemini 1.5 Pro)")
 st.markdown(
-    "Get a **business-level executive summary** of customer pain points "
-    "and concrete recommendations, generated from negative reviews "
+    "Generate an executive summary of customer pain points from negative reviews "
     "(`Recommended IND == 0`)."
 )
 
-ai_col1, _ = st.columns([1, 3])
-trigger = ai_col1.button(
-    "🚀 Generate Insights", type="primary", use_container_width=True
-)
+trigger = st.button("🚀 Generate Insights", type="primary")
 
 
 def collect_negative_samples() -> Tuple[list[str], str]:
-    """
-    Filter for negative reviews (Recommended IND == 0) and return up to 10
-    randomly-sampled review texts for Gemini.
-
-    Preference order:
-      1. Predicted negatives from the user-uploaded dataset.
-      2. Predicted negatives from the base dataset's held-out test set.
-    """
+    """Get up to 10 negative review texts for Gemini."""
+    # Try user upload first
     if predicted_df is not None and user_text_col is not None:
-        neg_mask = predicted_df["Predicted_IND"] == NEGATIVE_LABEL
-        neg_texts = (
-            predicted_df.loc[neg_mask, user_text_col]
-            .fillna("")
-            .astype(str)
-            .tolist()
-        )
-        neg_texts = [t for t in neg_texts if t.strip()]
+        neg_texts = [
+            str(predicted_df.iloc[i][user_text_col])
+            for i in range(len(predicted_df))
+            if int(predicted_df.iloc[i]["Predicted_IND"]) == NEGATIVE_LABEL
+            and str(predicted_df.iloc[i][user_text_col]).strip()
+        ]
         if neg_texts:
-            sample = random.sample(neg_texts, k=min(10, len(neg_texts)))
-            return sample, "your uploaded dataset"
+            return random.sample(neg_texts, k=min(10, len(neg_texts))), "your uploaded data"
 
-    base_neg = [t for t in (base.get("base_negative_samples") or []) if str(t).strip()]
+    # Fallback: base dataset negatives
+    base_neg = [t for t in base.get("base_negative_samples", []) if str(t).strip()]
     if base_neg:
-        sample = random.sample(base_neg, k=min(10, len(base_neg)))
-        return sample, "the base dataset's negative test reviews"
+        return random.sample(base_neg, k=min(10, len(base_neg))), "base dataset test set"
     return [], "no source"
 
 
 if trigger:
     if not api_key:
         st.warning(
-            "Gemini API key is not configured. Add `GEMINI_API_KEY` to your "
-            "`.streamlit/secrets.toml` (locally) or to your Streamlit Cloud "
-            "secrets, then refresh."
+            "Gemini API key not configured. Add `GEMINI_API_KEY` to "
+            "`.streamlit/secrets.toml` then refresh."
         )
     else:
         samples, source = collect_negative_samples()
         if not samples:
             st.info("No negative reviews available to analyze.")
         else:
-            with st.expander(
-                f"📝 Reviews sent to Gemini (from {source})", expanded=False
-            ):
-                for i, s in enumerate(samples, start=1):
+            with st.expander(f"📝 Reviews sent to Gemini ({source})", expanded=False):
+                for i, s in enumerate(samples, 1):
                     st.markdown(f"{i}. {s}")
             with st.spinner("Consulting Gemini 1.5 Pro..."):
                 try:
@@ -495,9 +414,7 @@ if trigger:
                     st.markdown("### 💼 Executive Insights")
                     st.markdown(output)
 
-# ----------------------------------------------------------------------------
-# Footer
-# ----------------------------------------------------------------------------
+# --- Footer ---
 st.divider()
 st.caption(
     "Built with Streamlit · scikit-learn · Google Generative AI · "

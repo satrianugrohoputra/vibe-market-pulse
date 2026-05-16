@@ -3,7 +3,11 @@ Hybrid E-Commerce Sentiment Analyzer
 ====================================
 A Streamlit app that combines a Traditional NLP ML pipeline (TF-IDF + Logistic
 Regression) with Generative AI (Gemini 1.5 Pro) for executive-level insights
-on user-uploaded e-commerce review datasets.
+on e-commerce review datasets.
+
+Base dataset columns (Women's E-Commerce Clothing Reviews):
+    - "Review Text"     : free-text customer review
+    - "Recommended IND" : 1 = Positive (recommended), 0 = Negative (not recommended)
 """
 
 from __future__ import annotations
@@ -22,6 +26,23 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
 # ----------------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------------
+BASE_DATASET_PATH = "ecommercereviews.csv"
+TEXT_COL = "Review Text"
+TARGET_COL = "Recommended IND"
+
+# Numeric label conventions for "Recommended IND"
+NEGATIVE_LABEL = 0  # not recommended
+POSITIVE_LABEL = 1  # recommended
+
+# Friendly display names for the two classes
+LABEL_DISPLAY = {
+    NEGATIVE_LABEL: "Negative",
+    POSITIVE_LABEL: "Positive",
+}
+
+# ----------------------------------------------------------------------------
 # Page Config
 # ----------------------------------------------------------------------------
 st.set_page_config(
@@ -31,86 +52,69 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-BASE_DATASET_PATH = "ecommercereviews.csv"
-
-# Common candidate column names for auto-detection (ordered by priority)
-TEXT_COLUMN_CANDIDATES = [
-    "Review Text", "review_text", "Review", "review",
-    "Text", "text", "Reviews", "reviews",
-    "Comment", "comment", "Feedback", "feedback", "Message", "message",
-    "Content", "content", "Body", "body",
-]
-TARGET_COLUMN_CANDIDATES = [
-    "Sentiment", "sentiment", "Label", "label",
-    "Rating", "rating", "Recommended IND", "recommended_ind",
-    "Class", "class", "Target", "target", "Score", "score",
-]
-
-
-def map_rating_to_sentiment(value) -> Optional[str]:
-    """Map a numeric rating (1-5) to Positive / Neutral / Negative."""
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
-    if v >= 4:
-        return "Positive"
-    if v == 3:
-        return "Neutral"
-    if v <= 2:
-        return "Negative"
-    return None
-
-
-def coerce_target_to_sentiment(series: pd.Series) -> pd.Series:
-    """
-    If the target series looks numeric (e.g., 1-5 ratings), map values to
-    Positive / Neutral / Negative. Otherwise return the series unchanged
-    (as strings).
-    """
-    # Treat as numeric if at least 80% of non-null values parse as numbers
-    numeric_count = pd.to_numeric(series, errors="coerce").notna().sum()
-    total = series.notna().sum()
-    if total > 0 and numeric_count / total >= 0.8:
-        mapped = series.apply(map_rating_to_sentiment)
-        return mapped
-    return series.astype(str)
 
 # ----------------------------------------------------------------------------
-# Helpers
+# Data cleaning helpers
 # ----------------------------------------------------------------------------
-def detect_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
-    """Return the first matching column name from candidates, else None."""
+def clean_review_dataframe(
+    df: pd.DataFrame,
+    text_col: str = TEXT_COL,
+    target_col: Optional[str] = TARGET_COL,
+) -> pd.DataFrame:
+    """
+    Clean a reviews dataframe so it is safe to feed into TfidfVectorizer.
+
+    Rules:
+      * Drop rows where the target column is NaN (only when target_col is given).
+      * Fill NaN in the text column with empty string ('').
+      * Coerce the target column to int (0 / 1).
+    """
+    out = df.copy()
+
+    if target_col is not None and target_col in out.columns:
+        # Drop rows where the target/label is missing - these are unusable for
+        # supervised training.
+        out = out.dropna(subset=[target_col])
+        # Force numeric, drop anything that won't coerce, then cast to int.
+        out[target_col] = pd.to_numeric(out[target_col], errors="coerce")
+        out = out.dropna(subset=[target_col])
+        out[target_col] = out[target_col].astype(int)
+
+    if text_col in out.columns:
+        # CRITICAL: TfidfVectorizer will raise AttributeError on NaN in the text
+        # column, so fill with empty string before passing it any text.
+        out[text_col] = out[text_col].fillna("").astype(str)
+
+    return out
+
+
+def find_text_column(df: pd.DataFrame) -> Optional[str]:
+    """
+    Locate a usable review text column on a user-uploaded CSV.
+
+    Priority:
+      1. The exact base column name ("Review Text").
+      2. Common alternates (Review, Text, Comment, ...).
+      3. Fallback: the object column with the longest average string length.
+    """
+    if TEXT_COL in df.columns:
+        return TEXT_COL
+
+    candidates = [
+        "Review Text", "review_text", "Review", "review",
+        "Text", "text", "Reviews", "reviews",
+        "Comment", "comment", "Feedback", "feedback",
+        "Message", "message", "Content", "content", "Body", "body",
+    ]
     for c in candidates:
         if c in df.columns:
             return c
-    return None
 
-
-def detect_text_column(df: pd.DataFrame) -> Optional[str]:
-    """Detect the most likely text column by name, falling back to longest avg string."""
-    direct = detect_column(df, TEXT_COLUMN_CANDIDATES)
-    if direct is not None:
-        return direct
-    # Fallback: pick the object column with the longest average string length
     object_cols = df.select_dtypes(include="object").columns.tolist()
     if not object_cols:
         return None
-    avg_lengths = {c: df[c].astype(str).str.len().mean() for c in object_cols}
+    avg_lengths = {c: df[c].fillna("").astype(str).str.len().mean() for c in object_cols}
     return max(avg_lengths, key=avg_lengths.get) if avg_lengths else None
-
-
-def detect_target_column(df: pd.DataFrame, exclude: Optional[str] = None) -> Optional[str]:
-    """Detect a target/sentiment column."""
-    direct = detect_column(df, TARGET_COLUMN_CANDIDATES)
-    if direct is not None and direct != exclude:
-        return direct
-    # Fallback: any column with a small number of unique values that isn't the text col
-    candidates = [
-        c for c in df.columns
-        if c != exclude and df[c].nunique(dropna=True) <= 10
-    ]
-    return candidates[0] if candidates else None
 
 
 # ----------------------------------------------------------------------------
@@ -119,47 +123,43 @@ def detect_target_column(df: pd.DataFrame, exclude: Optional[str] = None) -> Opt
 @st.cache_resource(show_spinner="Training base sentiment model...")
 def train_base_pipeline() -> dict:
     """
-    Loads the base ecommercereviews.csv, auto-detects columns, trains a
-    TF-IDF + Logistic Regression pipeline on an 80/20 split, and returns
-    the trained pipeline along with evaluation artifacts.
+    Loads the base ecommercereviews.csv, trains a TF-IDF + Logistic Regression
+    pipeline (80/20 split) on `Review Text` -> `Recommended IND`, and returns
+    the trained pipeline plus evaluation artifacts.
     """
     df = pd.read_csv(BASE_DATASET_PATH)
 
-    text_col = detect_text_column(df)
-    target_col = detect_target_column(df, exclude=text_col)
-
-    if text_col is None or target_col is None:
+    # Validate the expected columns exist
+    missing = [c for c in (TEXT_COL, TARGET_COL) if c not in df.columns]
+    if missing:
         raise ValueError(
-            f"Could not detect text/target columns in {BASE_DATASET_PATH}. "
-            f"Found columns: {list(df.columns)}"
+            f"Base dataset is missing required column(s) {missing}. "
+            f"Found: {list(df.columns)}"
         )
 
-    # Clean & drop NA rows
-    df = df[[text_col, target_col]].dropna()
-    df[text_col] = df[text_col].astype(str)
+    # CRITICAL data cleaning: drop NaN labels, fill NaN text with ''.
+    df = clean_review_dataframe(df, text_col=TEXT_COL, target_col=TARGET_COL)
 
-    # If target looks numeric (e.g., 1-5 ratings), map to Positive/Neutral/Negative
-    df[target_col] = coerce_target_to_sentiment(df[target_col])
-    df = df.dropna(subset=[target_col])
-    df[target_col] = df[target_col].astype(str)
+    # Keep only rows that are valid for our binary classification.
+    df = df[df[TARGET_COL].isin([NEGATIVE_LABEL, POSITIVE_LABEL])]
 
-    # Drop any classes with fewer than 2 samples (otherwise stratify fails)
-    counts = df[target_col].value_counts()
-    valid_classes = counts[counts >= 2].index
-    df = df[df[target_col].isin(valid_classes)]
+    if df.empty:
+        raise ValueError("No usable rows after cleaning the base dataset.")
 
-    X = df[text_col].values
-    y = df[target_col].values
+    X = df[TEXT_COL].values
+    y = df[TARGET_COL].values
+
+    # Stratify only when both classes have at least 2 samples.
+    stratify = y if pd.Series(y).value_counts().min() >= 2 else None
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42,
-        stratify=y if pd.Series(y).value_counts().min() >= 2 else None,
+        X, y, test_size=0.20, random_state=42, stratify=stratify,
     )
 
     pipeline = Pipeline([
         ("tfidf", TfidfVectorizer(
             ngram_range=(1, 2),
-            min_df=1,
+            min_df=2,
             max_df=0.95,
             stop_words="english",
             sublinear_tf=True,
@@ -176,45 +176,29 @@ def train_base_pipeline() -> dict:
     y_pred = pipeline.predict(X_test)
 
     accuracy = accuracy_score(y_test, y_pred)
-    report = classification_report(y_test, y_pred, zero_division=0)
-
-    # Build a small "negative test set" for fallback Gemini analysis
-    test_df = pd.DataFrame({"text": X_test, "actual": y_test, "predicted": y_pred})
-    negative_label = _resolve_negative_label(pd.Series(y))
-    base_negatives = (
-        test_df[test_df["predicted"].astype(str).str.lower() == str(negative_label).lower()]
-        ["text"].tolist()
-        if negative_label is not None else []
+    target_names = [LABEL_DISPLAY[c] for c in sorted(set(y_test))]
+    report = classification_report(
+        y_test, y_pred, target_names=target_names, zero_division=0
     )
+
+    # Sample of negatives from the held-out test set, used by the AI Consultant
+    # when no user file has been uploaded.
+    test_df = pd.DataFrame({"text": X_test, "actual": y_test, "predicted": y_pred})
+    base_negatives = test_df.loc[
+        test_df["predicted"] == NEGATIVE_LABEL, "text"
+    ].astype(str).tolist()
 
     return {
         "pipeline": pipeline,
-        "text_col": text_col,
-        "target_col": target_col,
+        "text_col": TEXT_COL,
+        "target_col": TARGET_COL,
         "accuracy": accuracy,
         "report": report,
-        "classes": list(pipeline.classes_),
+        "classes": [LABEL_DISPLAY[c] for c in pipeline.classes_],
         "base_negative_samples": base_negatives,
-        "negative_label": negative_label,
         "n_train": len(X_train),
         "n_test": len(X_test),
     }
-
-
-def _resolve_negative_label(y: pd.Series) -> Optional[str]:
-    """Find the label that represents 'negative' sentiment."""
-    unique_labels = [str(u) for u in y.unique()]
-    # Try common negative label names
-    for candidate in ["Negative", "negative", "NEGATIVE", "neg", "0", "1"]:
-        if candidate in unique_labels:
-            # For numeric ratings, "1" is typically the lowest/negative
-            if candidate in ("0", "1"):
-                # Only treat numeric as negative if labels look like ratings
-                if all(u.isdigit() for u in unique_labels):
-                    return candidate
-                continue
-            return candidate
-    return None
 
 
 # ----------------------------------------------------------------------------
@@ -261,7 +245,6 @@ def call_gemini_consultant(api_key: str, negative_reviews: list[str]) -> str:
     )
 
     response = model.generate_content(prompt)
-    # google-generativeai returns .text for simple prompts
     return getattr(response, "text", str(response))
 
 
@@ -295,13 +278,14 @@ except Exception as exc:
 with st.sidebar:
     st.header("📂 Upload New Reviews")
     st.markdown(
-        "Upload a CSV containing a column of customer review text. "
-        "The trained model will predict each review's sentiment."
+        "Upload a CSV containing a `Review Text` column. "
+        "The trained model will predict whether each review is "
+        "**Positive** (recommended) or **Negative** (not recommended)."
     )
     uploaded_file = st.file_uploader(
         "Drop a CSV file",
         type=["csv"],
-        help="Should include a column with review text (e.g., 'Review', 'Text', 'Comment').",
+        help="Should include a column named 'Review Text' (or similar).",
     )
 
     st.divider()
@@ -334,9 +318,9 @@ col4.metric("Classes", len(base["classes"]))
 with st.expander("📋 Classification Report (held-out test set)", expanded=False):
     st.code(base["report"], language="text")
     st.caption(
-        f"Detected text column: **{base['text_col']}** · "
-        f"Detected target column: **{base['target_col']}** · "
-        f"Classes: {', '.join(base['classes'])}"
+        f"Text column: **{base['text_col']}** · "
+        f"Target column: **{base['target_col']}** "
+        f"(1 = Positive / Recommended, 0 = Negative / Not Recommended)"
     )
 
 st.divider()
@@ -358,19 +342,26 @@ if uploaded_file is not None:
         uploaded_df = None
 
 if uploaded_df is not None:
-    user_text_col = detect_text_column(uploaded_df)
+    user_text_col = find_text_column(uploaded_df)
     if user_text_col is None:
         st.error(
             "Could not detect a text column in your file. Please ensure your "
-            "CSV has a column named one of: "
-            f"{', '.join(TEXT_COLUMN_CANDIDATES[:6])}, ..."
+            "CSV has a column named `Review Text` (or `Review`, `Text`, `Comment`, ...)."
         )
     else:
+        # Apply the same cleaning rules used during training, so the
+        # vectorizer never receives NaN.
+        cleaned_df = clean_review_dataframe(
+            uploaded_df, text_col=user_text_col, target_col=None
+        )
+
         with st.spinner("Predicting sentiments..."):
-            texts = uploaded_df[user_text_col].astype(str).fillna("")
-            preds = base["pipeline"].predict(texts.values)
-            predicted_df = uploaded_df.copy()
-            predicted_df["Predicted_Sentiment"] = preds
+            preds = base["pipeline"].predict(cleaned_df[user_text_col].values)
+            predicted_df = cleaned_df.copy()
+            predicted_df["Predicted_IND"] = preds
+            predicted_df["Predicted_Sentiment"] = predicted_df["Predicted_IND"].map(
+                LABEL_DISPLAY
+            )
 
         st.success(
             f"Predicted **{len(predicted_df)}** rows using column `{user_text_col}`."
@@ -396,7 +387,6 @@ if uploaded_df is not None:
                 color_discrete_map={
                     "Positive": "#22c55e",
                     "Negative": "#ef4444",
-                    "Neutral": "#94a3b8",
                 },
             )
             fig.update_traces(textinfo="percent+label")
@@ -409,7 +399,7 @@ if uploaded_df is not None:
             st.bar_chart(dist.set_index("Sentiment")["Count"])
 
         st.markdown("**First 10 Predictions**")
-        preview_cols = [user_text_col, "Predicted_Sentiment"]
+        preview_cols = [user_text_col, "Predicted_IND", "Predicted_Sentiment"]
         st.dataframe(
             predicted_df[preview_cols].head(10),
             use_container_width=True,
@@ -440,25 +430,39 @@ st.divider()
 st.subheader("🤖 Ask AI Consultant (Gemini 1.5 Pro)")
 st.markdown(
     "Get a **business-level executive summary** of customer pain points "
-    "and concrete recommendations, generated from negative reviews."
+    "and concrete recommendations, generated from negative reviews "
+    "(`Recommended IND == 0`)."
 )
 
-ai_col1, ai_col2 = st.columns([1, 3])
-trigger = ai_col1.button("🚀 Generate Insights", type="primary", use_container_width=True)
+ai_col1, _ = st.columns([1, 3])
+trigger = ai_col1.button(
+    "🚀 Generate Insights", type="primary", use_container_width=True
+)
 
-# Decide which negative reviews to send
+
 def collect_negative_samples() -> Tuple[list[str], str]:
-    """Return (samples, source_label)."""
+    """
+    Filter for negative reviews (Recommended IND == 0) and return up to 10
+    randomly-sampled review texts for Gemini.
+
+    Preference order:
+      1. Predicted negatives from the user-uploaded dataset.
+      2. Predicted negatives from the base dataset's held-out test set.
+    """
     if predicted_df is not None and user_text_col is not None:
-        neg_mask = (
-            predicted_df["Predicted_Sentiment"].astype(str).str.lower() == "negative"
+        neg_mask = predicted_df["Predicted_IND"] == NEGATIVE_LABEL
+        neg_texts = (
+            predicted_df.loc[neg_mask, user_text_col]
+            .fillna("")
+            .astype(str)
+            .tolist()
         )
-        neg_texts = predicted_df.loc[neg_mask, user_text_col].astype(str).tolist()
+        neg_texts = [t for t in neg_texts if t.strip()]
         if neg_texts:
             sample = random.sample(neg_texts, k=min(10, len(neg_texts)))
             return sample, "your uploaded dataset"
-    # Fallback to base test negatives
-    base_neg = base.get("base_negative_samples") or []
+
+    base_neg = [t for t in (base.get("base_negative_samples") or []) if str(t).strip()]
     if base_neg:
         sample = random.sample(base_neg, k=min(10, len(base_neg)))
         return sample, "the base dataset's negative test reviews"
@@ -477,7 +481,9 @@ if trigger:
         if not samples:
             st.info("No negative reviews available to analyze.")
         else:
-            with st.expander(f"📝 Reviews sent to Gemini (from {source})", expanded=False):
+            with st.expander(
+                f"📝 Reviews sent to Gemini (from {source})", expanded=False
+            ):
                 for i, s in enumerate(samples, start=1):
                     st.markdown(f"{i}. {s}")
             with st.spinner("Consulting Gemini 1.5 Pro..."):

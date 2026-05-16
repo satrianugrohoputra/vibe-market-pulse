@@ -372,7 +372,13 @@ trigger = st.button("🚀 Generate Insights", type="primary")
 
 
 def collect_negative_samples() -> Tuple[list[str], str]:
-    """Get up to 10 negative review texts for Gemini."""
+    """
+    Get up to 10 negative review texts for Gemini.
+
+    Returns (samples, source_label). If user uploaded data has zero negatives,
+    returns ([], "user_all_positive") so the caller can show a congratulatory
+    message instead of crashing on random.sample with an empty sequence.
+    """
     # Try user upload first
     if predicted_df is not None and user_text_col is not None:
         neg_texts = [
@@ -381,14 +387,16 @@ def collect_negative_samples() -> Tuple[list[str], str]:
             if int(predicted_df.iloc[i]["Predicted_IND"]) == NEGATIVE_LABEL
             and str(predicted_df.iloc[i][user_text_col]).strip()
         ]
-        if neg_texts:
-            return random.sample(neg_texts, k=min(10, len(neg_texts))), "your uploaded data"
+        if len(neg_texts) == 0:
+            # User uploaded data is 100% positive — no negatives to sample
+            return [], "user_all_positive"
+        return random.sample(neg_texts, k=min(10, len(neg_texts))), "your uploaded data"
 
     # Fallback: base dataset negatives
     base_neg = [t for t in base.get("base_negative_samples", []) if str(t).strip()]
-    if base_neg:
-        return random.sample(base_neg, k=min(10, len(base_neg))), "base dataset test set"
-    return [], "no source"
+    if len(base_neg) == 0:
+        return [], "no source"
+    return random.sample(base_neg, k=min(10, len(base_neg))), "base dataset test set"
 
 
 if trigger:
@@ -400,7 +408,14 @@ if trigger:
     else:
         samples, source = collect_negative_samples()
         if not samples:
-            st.info("No negative reviews available to analyze.")
+            # Safety check: empty list means no negatives to analyze
+            if source == "user_all_positive":
+                st.success(
+                    "Great news! There are no negative reviews in this dataset. "
+                    "Your customers are fully satisfied!"
+                )
+            else:
+                st.info("No negative reviews available to analyze.")
         else:
             with st.expander(f"📝 Reviews sent to Gemini ({source})", expanded=False):
                 for i, s in enumerate(samples, 1):

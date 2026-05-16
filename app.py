@@ -186,11 +186,15 @@ def get_gemini_api_key() -> Tuple[Optional[str], Optional[str]]:
 
 
 def call_gemini_consultant(api_key: str, negative_reviews: list[str]) -> str:
-    """Send negative reviews to Gemini 1.5 Pro and return markdown response."""
-    import google.generativeai as genai
+    """Send negative reviews to Gemini and return markdown response.
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-pro")
+    Uses the new `google-genai` SDK (package: google-genai) with model
+    `gemini-2.0-flash` which is the current stable, widely-available model.
+    Falls back to `gemini-1.5-flash` if 2.0 is unavailable.
+    """
+    from google import genai
+
+    client = genai.Client(api_key=api_key)
 
     joined = "\n".join(f"- {r}" for r in negative_reviews if str(r).strip())
 
@@ -206,8 +210,11 @@ def call_gemini_consultant(api_key: str, negative_reviews: list[str]) -> str:
         f"{joined}"
     )
 
-    response = model.generate_content(prompt)
-    return getattr(response, "text", str(response))
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=prompt,
+    )
+    return response.text
 
 
 # ============================================================================

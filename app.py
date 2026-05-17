@@ -51,9 +51,6 @@ POSITIVE_LABEL = 1  # recommended
 
 LABEL_MAP = {0: "Negative", 1: "Positive"}
 
-# Gemini model — using current stable, widely-available model on the Gemini
-# Developer API. gemini-2.5-flash is fast, cheap, and supports generateContent.
-GEMINI_MODEL = "gemini-2.5-flash"
 
 # ----------------------------------------------------------------------------
 # Page Config
@@ -189,11 +186,10 @@ def get_gemini_api_key() -> Tuple[Optional[str], Optional[str]]:
         return None, f"Could not read secrets: {exc}"
 
 
-def call_gemini_consultant(api_key: str, negative_reviews: list[str]) -> str:
+def call_gemini_consultant(api_key: str, negative_reviews: list[str], model_name: str = "gemini-2.5-flash") -> str:
     """
     Send negative reviews to Gemini and request an aspect-based business
-    intelligence summary. Uses the modern `google-genai` SDK with
-    `gemini-2.5-flash`.
+    intelligence summary dynamically using the selected model.
     """
     from google import genai
     client = genai.Client(api_key=api_key)
@@ -235,10 +231,10 @@ def call_gemini_consultant(api_key: str, negative_reviews: list[str]) -> str:
     )
 
     response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
+        model=model_name,
+        contents=prompt
     )
-    return response.text
+    return getattr(response, "text", str(response))
 
 
 # ============================================================================
@@ -285,7 +281,7 @@ with st.sidebar:
         "**Tech Stack**\n"
         "- scikit-learn (TF-IDF + LogReg)\n"
         "- Pandas / Plotly\n"
-        f"- Google GenAI SDK ({GEMINI_MODEL})"
+        f"- Google GenAI SDK (GEMINI_MODEL)"
     )
 
 # --- Model Performance ---
@@ -464,6 +460,16 @@ else:
 
 st.divider()
 
+# Gemini model — using current stable, widely-available model on the Gemini
+selected_model = st.selectbox(
+    "Pilih Model AI Google (Free Tier):",
+    ["gemini-2.5-flash", "gemini-3.1-flash-lite"],
+    index=0
+)
+
+GEMINI_MODEL = selected_model
+model_name = selected_model
+
 # ============================================================================
 # Gemini AI Consultant — Aspect-Based Business Intelligence
 # ============================================================================
@@ -520,7 +526,8 @@ if trigger:
                     st.markdown(f"{i}. {s}")
             with st.spinner(f"Consulting {GEMINI_MODEL}..."):
                 try:
-                    output = call_gemini_consultant(api_key, samples)
+                    # TAMBAHKAN model_name ATAU GEMINI_MODEL SEBAGAI ARGUMEN KETIGA
+                    output = call_gemini_consultant(api_key, samples, model_name=GEMINI_MODEL)
                 except Exception as exc:
                     st.error(f"Gemini request failed: {exc}")
                 else:

@@ -140,10 +140,16 @@ def train_base_pipeline() -> dict:
     y_pred = pipeline.predict(X_test)
 
     accuracy = accuracy_score(y_test, y_pred)
-    report = classification_report(
+    report_text = classification_report(
         y_test, y_pred,
         target_names=["Negative (0)", "Positive (1)"],
         zero_division=0,
+    )
+    report_dict = classification_report(
+        y_test, y_pred,
+        target_names=["Negative (0)", "Positive (1)"],
+        zero_division=0,
+        output_dict=True,
     )
 
     base_negatives = [
@@ -154,11 +160,126 @@ def train_base_pipeline() -> dict:
     return {
         "pipeline": pipeline,
         "accuracy": accuracy,
-        "report": report,
+        "report": report_text,
+        "report_dict": report_dict,
         "classes": ["Negative", "Positive"],
         "base_negative_samples": base_negatives,
         "n_train": len(X_train),
         "n_test": len(X_test),
+        "domain": "clothing",
+    }
+
+
+# ============================================================================
+# Dynamic Domain Pipeline — Trains on-the-fly from uploaded data
+# ============================================================================
+def train_domain_pipeline(
+    df: pd.DataFrame,
+    text_col: str,
+    domain: str,
+) -> Optional[dict]:
+    """
+    Train a TF-IDF + Logistic Regression pipeline dynamically from an uploaded
+    dataset. Uses the rating column to generate binary labels:
+        rating >= 4 → Positive (1)
+        rating <= 2 → Negative (0)
+        rating == 3 → excluded (ambiguous)
+
+    Returns a dict with the same structure as train_base_pipeline(), or None
+    if the dataset lacks a usable rating column or has insufficient labeled data.
+    """
+    # --- Find rating column ---
+    rating_col: Optional[str] = None
+    for col in df.columns:
+        name = str(col).strip().lower()
+        if "rating" in name or "score" in name or "star" in name:
+            rating_col = col
+            break
+
+    if rating_col is None:
+        return None  # Cannot train without rating signal
+
+    # --- Build labeled subset ---
+    work = df[[text_col, rating_col]].copy()
+    work[text_col] = work[text_col].fillna("").astype(str)
+    work[rating_col] = pd.to_numeric(work[rating_col], errors="coerce")
+    work = work.dropna(subset=[rating_col])
+
+    # Derive binary labels from rating
+    work["_label"] = -1  # placeholder
+    work.loc[work[rating_col] >= 4, "_label"] = POSITIVE_LABEL
+    work.loc[work[rating_col] <= 2, "_label"] = NEGATIVE_LABEL
+
+    # Drop ambiguous (rating == 3) and empty text
+    work = work[work["_label"].isin([0, 1])].reset_index(drop=True)
+    work = work[work[text_col].str.strip().astype(bool)].reset_index(drop=True)
+
+    if len(work) < 20:
+        return None  # Not enough data to train a meaningful model
+
+    X = work[text_col].tolist()
+    y = work["_label"].astype(int).tolist()
+
+    # Check class balance — need at least 2 of each class
+    from collections import Counter
+    counts = Counter(y)
+    if counts.get(0, 0) < 2 or counts.get(1, 0) < 2:
+        return None
+
+    # Stratified split
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.20, random_state=42, stratify=y,
+        )
+    except ValueError:
+        return None  # Stratification impossible
+
+    pipeline = Pipeline([
+        ("tfidf", TfidfVectorizer(
+            ngram_range=(1, 2),
+            min_df=2,
+            max_df=0.95,
+            sublinear_tf=True,
+        )),
+        ("clf", LogisticRegression(
+            max_iter=1000,
+            C=1.0,
+            class_weight="balanced",
+            random_state=42,
+        )),
+    ])
+
+    pipeline.fit(X_train, y_train)
+    y_pred = pipeline.predict(X_test)
+
+    accuracy = accuracy_score(y_test, y_pred)
+    report_text = classification_report(
+        y_test, y_pred,
+        target_names=["Negative (0)", "Positive (1)"],
+        zero_division=0,
+    )
+    report_dict = classification_report(
+        y_test, y_pred,
+        target_names=["Negative (0)", "Positive (1)"],
+        zero_division=0,
+        output_dict=True,
+    )
+
+    neg_samples = [
+        X_test[i] for i in range(len(X_test))
+        if y_pred[i] == NEGATIVE_LABEL and str(X_test[i]).strip()
+    ]
+
+    return {
+        "pipeline": pipeline,
+        "accuracy": accuracy,
+        "report": report_text,
+        "report_dict": report_dict,
+        "classes": ["Negative", "Positive"],
+        "base_negative_samples": neg_samples,
+        "n_train": len(X_train),
+        "n_test": len(X_test),
+        "domain": domain,
     }
 
 
@@ -459,30 +580,44 @@ with st.sidebar:
         f"- Google GenAI SDK (GEMINI_MODEL)"
     )
 
-# --- Model Performance ---
-st.subheader("📈 Model Performance (Base Dataset + Hybrid Pipeline)")
-st.caption(
-    "Base ML accuracy shown below. Uploaded data benefits from additional "
-    "**Auto-Routing** (domain/language detection) and **Rule-Based Correction** "
-    "(rating override) layers that improve effective accuracy beyond this baseline."
-)
+# --- Model Performance (dynamic — updated when domain pipeline trains) ---
+# We use a placeholder approach: show base metrics initially, then override
+# with domain-specific metrics if an uploaded dataset trains successfully.
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Base Accuracy", f"{base['accuracy'] * 100:.2f}%")
-col2.metric("Train Size", base["n_train"])
-col3.metric("Test Size", base["n_test"])
-col4.metric("Classes", len(base["classes"]))
+# Initialize active_eval to the base pipeline stats (default view)
+active_eval: dict = base
 
-with st.expander("📋 Classification Report & Pipeline Info", expanded=False):
-    st.code(base["report"], language="text")
-    st.markdown(
-        f"**Base Model**: TF-IDF (bigrams) + Logistic Regression\n\n"
-        f"**Text column**: `{TEXT_COL}` · **Target**: `{TARGET_COL}` (1=Positive, 0=Negative)\n\n"
-        f"**Enhancement Layers** (applied on user uploads):\n"
-        f"1. 🔍 Auto-Routing — detects domain (clothing/shoes/electronics) & language (EN/ID)\n"
-        f"2. ⚙️ Rule-Based Correction — overrides ML when star rating strongly disagrees\n"
-        f"3. 🤖 Gemini AI — domain-aware prompt engineering for business insights"
+def render_model_performance(eval_data: dict) -> None:
+    """Render the Model Performance section dynamically from eval_data dict."""
+    domain_label = eval_data.get("domain", "clothing").title()
+    st.subheader(f"📈 Model Performance (Base Dataset + Hybrid Pipeline)")
+    st.caption(
+        f"Base ML accuracy shown below. Uploaded data benefits from additional "
+        f"**Auto-Routing** (domain/language detection) and **Rule-Based Correction** "
+        f"(rating override) layers that improve effective accuracy beyond this baseline."
     )
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Base Accuracy", f"{eval_data['accuracy'] * 100:.2f}%")
+    col2.metric("Train Size", eval_data["n_train"])
+    col3.metric("Test Size", eval_data["n_test"])
+    col4.metric("Classes", len(eval_data["classes"]))
+
+    with st.expander("📋 Classification Report & Pipeline Info", expanded=False):
+        st.code(eval_data["report"], language="text")
+        st.markdown(
+            f"**Base Model**: TF-IDF (bigrams) + Logistic Regression "
+            f"(**{domain_label}** Optimized)\n\n"
+            f"**Enhancement Layers** (applied on user uploads):\n"
+            f"1. 🔍 Auto-Routing — detects domain (clothing/shoes/electronics) & language (EN/ID)\n"
+            f"2. ⚙️ Rule-Based Correction — overrides ML when star rating strongly disagrees\n"
+            f"3. 🤖 Gemini AI — domain-aware prompt engineering for business insights"
+        )
+
+# Render initial (base) performance — will be overridden below if domain trains
+_perf_placeholder = st.empty()
+with _perf_placeholder.container():
+    render_model_performance(active_eval)
 
 st.divider()
 
@@ -529,11 +664,32 @@ if uploaded_df is not None:
                 "Routing to multilingual handler."
             )
 
-        # TODO: Load specific .pkl model based on domain
-        # For now, all domains route to the single base pipeline.
-        # Future: model_registry = {"clothing": "clothing_model.pkl", ...}
-        # active_pipeline = load_domain_model(detected_domain)
-        active_pipeline = base["pipeline"]
+        # ==================================================================
+        # STEP 1b: Train domain-specific pipeline if rating column exists
+        # ==================================================================
+        domain_eval: Optional[dict] = None
+        with st.spinner(f"Training {detected_domain.title()} domain model..."):
+            domain_eval = train_domain_pipeline(
+                uploaded_df, user_text_col, detected_domain
+            )
+
+        if domain_eval is not None:
+            # Domain pipeline trained successfully — use it for predictions
+            active_pipeline = domain_eval["pipeline"]
+            active_eval = domain_eval
+            st.success(
+                f"🎯 Domain-specific model trained on uploaded data! "
+                f"Accuracy: **{domain_eval['accuracy'] * 100:.2f}%** "
+                f"(Train: {domain_eval['n_train']:,} · Test: {domain_eval['n_test']:,})"
+            )
+        else:
+            # Fallback to base pipeline (no rating column or insufficient data)
+            active_pipeline = base["pipeline"]
+            active_eval = base
+
+        # --- Render dynamic Model Performance with active eval ---
+        with _perf_placeholder.container():
+            render_model_performance(active_eval)
 
         # ==================================================================
         # STEP 2: ML Prediction using the routed pipeline

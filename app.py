@@ -596,6 +596,114 @@ if uploaded_df is not None:
         st.divider()
 
         # ====================================================================
+        # Product Intelligence — Dynamic Visualizations
+        # ====================================================================
+        st.subheader("📊 Product Intelligence")
+        st.caption(
+            "Automatic insights based on detected product and category columns. "
+            "Charts adapt to your dataset structure."
+        )
+
+        # --- Dynamic column detection for product/category ---
+        PRODUCT_CANDIDATES = ["product name", "title", "item", "product"]
+        CATEGORY_CANDIDATES = ["category", "class name", "department name", "brand", "department"]
+
+        def _find_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+            """Find the first column whose lowercase name contains a candidate."""
+            for col in df.columns:
+                col_lower = str(col).strip().lower()
+                for candidate in candidates:
+                    if candidate in col_lower:
+                        return col
+            return None
+
+        product_col = _find_column(predicted_df, PRODUCT_CANDIDATES)
+        category_col = _find_column(predicted_df, CATEGORY_CANDIDATES)
+
+        pi_left, pi_right = st.columns(2)
+
+        # --- Insight 1: Top 5 Viral Products (Positive) ---
+        with pi_left:
+            st.markdown("**🌟 Top 5 Viral Products** (Most Positive Reviews)")
+            if product_col is None:
+                st.info(
+                    "Product Name column not found in this dataset to "
+                    "generate this insight."
+                )
+            else:
+                positive_df = predicted_df[
+                    predicted_df["Predicted_IND"] == POSITIVE_LABEL
+                ].copy()
+                positive_df[product_col] = (
+                    positive_df[product_col].fillna("Unknown").astype(str)
+                )
+                top_products = (
+                    positive_df.groupby(product_col)
+                    .size()
+                    .reset_index(name="Count")
+                    .sort_values("Count", ascending=False)
+                    .head(5)
+                )
+                if top_products.empty:
+                    st.info("No positive reviews found to rank products.")
+                else:
+                    fig_viral = px.bar(
+                        top_products,
+                        x="Count",
+                        y=product_col,
+                        orientation="h",
+                        color_discrete_sequence=["#22c55e"],
+                    )
+                    fig_viral.update_layout(
+                        showlegend=False,
+                        yaxis_title="",
+                        xaxis_title="Positive Review Count",
+                        margin=dict(t=10, b=10, l=10, r=10),
+                        yaxis=dict(autorange="reversed"),
+                    )
+                    st.plotly_chart(fig_viral, use_container_width=True)
+
+        # --- Insight 2: Red Flag Categories (Negative) ---
+        with pi_right:
+            st.markdown("**🚨 Red Flag Categories** (Most Negative Reviews)")
+            if category_col is None:
+                st.info(
+                    "Category/Brand column not found in this dataset to "
+                    "generate this insight."
+                )
+            else:
+                negative_df = predicted_df[
+                    predicted_df["Predicted_IND"] == NEGATIVE_LABEL
+                ].copy()
+                negative_df[category_col] = (
+                    negative_df[category_col].fillna("Unknown").astype(str)
+                )
+                cat_counts = (
+                    negative_df.groupby(category_col)
+                    .size()
+                    .reset_index(name="Count")
+                    .sort_values("Count", ascending=False)
+                )
+                if cat_counts.empty:
+                    st.info("No negative reviews found to identify red flags.")
+                else:
+                    fig_flags = px.pie(
+                        cat_counts,
+                        names=category_col,
+                        values="Count",
+                        hole=0.4,
+                        color_discrete_sequence=px.colors.sequential.Reds_r,
+                    )
+                    fig_flags.update_traces(textinfo="percent+label")
+                    fig_flags.update_layout(
+                        showlegend=True,
+                        margin=dict(t=10, b=10, l=10, r=10),
+                    )
+                    st.plotly_chart(fig_flags, use_container_width=True)
+
+        st.divider()
+
+        # ====================================================================
         # Interactive Predictions Dashboard (search + filter)
         # ====================================================================
         st.markdown("### 🗂️ Interactive Predictions Explorer")

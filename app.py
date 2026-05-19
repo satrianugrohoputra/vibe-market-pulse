@@ -295,28 +295,94 @@ def get_gemini_api_key() -> Tuple[Optional[str], Optional[str]]:
         return None, f"Could not read secrets: {exc}"
 
 
-def call_gemini_consultant(api_key: str, negative_reviews: list[str], model_name: str = "gemini-2.5-flash") -> str:
+def call_gemini_consultant(
+    api_key: str,
+    negative_reviews: list[str],
+    model_name: str = "gemini-2.5-flash",
+    domain: str = "general",
+    language: str = "English",
+    rule_corrected_count: int = 0,
+) -> str:
     """
     Send negative reviews to Gemini and request an aspect-based business
     intelligence summary dynamically using the selected model.
+
+    The prompt adapts based on:
+    - domain: adjusts suggested aspect categories (clothing vs shoes vs electronics)
+    - language: if Indonesian, instructs Gemini to handle multilingual input
+    - rule_corrected_count: informs Gemini about data pre-processing context
     """
     from google import genai
     client = genai.Client(api_key=api_key)
 
     joined = "\n".join(f"- {r}" for r in negative_reviews if str(r).strip())
 
+    # --- Domain-specific aspect suggestions ---
+    domain_aspects = {
+        "clothing": (
+            "  - Sizing & Fit\n"
+            "  - Material & Fabric Quality\n"
+            "  - Design & Style\n"
+            "  - Color Accuracy\n"
+            "  - Durability & Washing\n"
+        ),
+        "shoes": (
+            "  - Comfort & Cushioning\n"
+            "  - Sizing & Fit\n"
+            "  - Sole & Grip Quality\n"
+            "  - Durability & Wear\n"
+            "  - Design & Aesthetics\n"
+        ),
+        "electronics": (
+            "  - Battery & Power\n"
+            "  - Screen & Display\n"
+            "  - Sound & Audio Quality\n"
+            "  - Build Quality & Durability\n"
+            "  - Connectivity & Performance\n"
+        ),
+        "general": (
+            "  - Product Quality\n"
+            "  - Sizing & Fit\n"
+            "  - Material Quality\n"
+            "  - Design & Style\n"
+            "  - Customer Service\n"
+            "  - Shipping & Delivery\n"
+            "  - Pricing & Value\n"
+        ),
+    }
+
+    aspects_block = domain_aspects.get(domain, domain_aspects["general"])
+
+    # --- Language instruction ---
+    lang_instruction = ""
+    if language == "Indonesian":
+        lang_instruction = (
+            "\n**IMPORTANT**: The reviews below are in Indonesian (Bahasa Indonesia). "
+            "Analyze them in their original language but produce your report in English. "
+            "Translate key phrases when quoting from reviews.\n\n"
+        )
+
+    # --- Rule correction context ---
+    correction_note = ""
+    if rule_corrected_count > 0:
+        correction_note = (
+            f"\n**Note**: A Rule-Based Correction system pre-filtered this data. "
+            f"{rule_corrected_count} predictions were overridden where star ratings "
+            f"strongly contradicted the ML model. The reviews below are confirmed "
+            f"negatives after both ML and rule-based validation.\n\n"
+        )
+
     prompt = (
         "You are a senior Business Consultant specializing in e-commerce "
         "customer experience analysis. Read the negative customer reviews "
         "below and produce an aspect-based business-intelligence report.\n\n"
+        f"**Detected Domain**: {domain.title()}\n"
+        f"**Detected Language**: {language}\n"
+        f"{lang_instruction}"
+        f"{correction_note}"
         "Categorize the pain points into specific business aspects such as "
         "(but not limited to):\n"
-        "  - Sizing & Fit\n"
-        "  - Material Quality\n"
-        "  - Design & Style\n"
-        "  - Customer Service\n"
-        "  - Shipping & Delivery\n"
-        "  - Pricing & Value\n\n"
+        f"{aspects_block}\n"
         "Only include aspects that actually appear in the reviews — skip any "
         "that don't have evidence. Quote short phrases from the reviews where "
         "useful.\n\n"
@@ -351,8 +417,8 @@ def call_gemini_consultant(api_key: str, negative_reviews: list[str], model_name
 # ============================================================================
 st.title("🛍️ Hybrid E-Commerce Sentiment Analyzer")
 st.caption(
-    "Traditional ML (TF-IDF + Logistic Regression) **+** Generative AI "
-    f"(Gemini 2.5 Flash) for actionable business insights."
+    "Traditional ML (TF-IDF + Logistic Regression) **+** Auto-Routing Domain Detection "
+    "**+** Rule-Based ML Correction **+** Generative AI (Gemini) for actionable business insights."
 )
 
 # --- Train Base Model ---
@@ -394,19 +460,28 @@ with st.sidebar:
     )
 
 # --- Model Performance ---
-st.subheader("📈 Model Performance (Base Dataset)")
+st.subheader("📈 Model Performance (Base Dataset + Hybrid Pipeline)")
+st.caption(
+    "Base ML accuracy shown below. Uploaded data benefits from additional "
+    "**Auto-Routing** (domain/language detection) and **Rule-Based Correction** "
+    "(rating override) layers that improve effective accuracy beyond this baseline."
+)
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Accuracy", f"{base['accuracy'] * 100:.2f}%")
+col1.metric("Base Accuracy", f"{base['accuracy'] * 100:.2f}%")
 col2.metric("Train Size", base["n_train"])
 col3.metric("Test Size", base["n_test"])
 col4.metric("Classes", len(base["classes"]))
 
-with st.expander("📋 Classification Report", expanded=False):
+with st.expander("📋 Classification Report & Pipeline Info", expanded=False):
     st.code(base["report"], language="text")
-    st.caption(
-        f"Text column: **{TEXT_COL}** · "
-        f"Target: **{TARGET_COL}** (1=Positive, 0=Negative)"
+    st.markdown(
+        f"**Base Model**: TF-IDF (bigrams) + Logistic Regression\n\n"
+        f"**Text column**: `{TEXT_COL}` · **Target**: `{TARGET_COL}` (1=Positive, 0=Negative)\n\n"
+        f"**Enhancement Layers** (applied on user uploads):\n"
+        f"1. 🔍 Auto-Routing — detects domain (clothing/shoes/electronics) & language (EN/ID)\n"
+        f"2. ⚙️ Rule-Based Correction — overrides ML when star rating strongly disagrees\n"
+        f"3. 🤖 Gemini AI — domain-aware prompt engineering for business insights"
     )
 
 st.divider()
@@ -620,13 +695,14 @@ GEMINI_MODEL = selected_model
 model_name = selected_model
 
 # ============================================================================
-# Gemini AI Consultant — Aspect-Based Business Intelligence
+# Gemini AI Consultant — Domain-Aware Aspect-Based Business Intelligence
 # ============================================================================
-st.subheader("🤖 Ask AI Consultant (Aspect-Based Analysis)")
+st.subheader("🤖 Ask AI Consultant (Domain-Aware Aspect Analysis)")
 st.markdown(
-    "Generate an executive **aspect-based** report from negative reviews "
-    "(`Recommended IND == 0`). Pain points are categorized by business area "
-    "(Sizing, Material, Service, Shipping, etc.) with prioritized action items."
+    "Generate an executive **aspect-based** report from negative reviews. "
+    "The prompt automatically adapts to the detected **domain** (clothing/shoes/electronics) "
+    "and **language** (English/Indonesian). Pain points are categorized by relevant "
+    "business areas with prioritized action items."
 )
 
 trigger = st.button("🚀 Generate Insights", type="primary")
@@ -668,15 +744,39 @@ if trigger:
             else:
                 st.info("No negative reviews available to analyze.")
         else:
+            # Determine domain/language context for prompt adaptation
+            _gemini_domain = "general"
+            _gemini_language = "English"
+            _gemini_corrections = 0
+
+            if predicted_df is not None and user_text_col is not None:
+                # Use detected domain/language from the upload flow
+                _gemini_domain, _gemini_language = detect_dataset_domain(
+                    predicted_df, user_text_col
+                )
+                if "Rule_Corrected" in predicted_df.columns:
+                    _gemini_corrections = int(predicted_df["Rule_Corrected"].sum())
+
             with st.expander(
                 f"📝 Reviews sent to Gemini ({source})", expanded=False
             ):
                 for i, s in enumerate(samples, 1):
                     st.markdown(f"{i}. {s}")
+                st.caption(
+                    f"Context → Domain: **{_gemini_domain.title()}** · "
+                    f"Language: **{_gemini_language}** · "
+                    f"Rule Corrections: **{_gemini_corrections}**"
+                )
             with st.spinner(f"Consulting {GEMINI_MODEL}..."):
                 try:
-                    # TAMBAHKAN model_name ATAU GEMINI_MODEL SEBAGAI ARGUMEN KETIGA
-                    output = call_gemini_consultant(api_key, samples, model_name=GEMINI_MODEL)
+                    output = call_gemini_consultant(
+                        api_key,
+                        samples,
+                        model_name=GEMINI_MODEL,
+                        domain=_gemini_domain,
+                        language=_gemini_language,
+                        rule_corrected_count=_gemini_corrections,
+                    )
                 except Exception as exc:
                     st.error(f"Gemini request failed: {exc}")
                 else:

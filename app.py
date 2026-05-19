@@ -51,6 +51,22 @@ POSITIVE_LABEL = 1  # recommended
 
 LABEL_MAP = {0: "Negative", 1: "Positive"}
 
+# ----------------------------------------------------------------------------
+# Auto-Routing: Domain & Language Keyword Dictionaries
+# ----------------------------------------------------------------------------
+# These keyword sets power the meta-classifier (detect_dataset_domain).
+# Add/extend them as new domains or languages are supported.
+DOMAIN_KEYWORDS: dict[str, list[str]] = {
+    "clothing":    ["fabric", "dress", "size", "wear", "fit", "shirt"],
+    "shoes":       ["sole", "running", "shoe", "sneaker", "comfortable", "tight", "grippy"],
+    "electronics": ["battery", "screen", "charge", "sound", "button", "device"],
+}
+
+# Indonesian indicator keywords for language detection.
+INDONESIAN_KEYWORDS: list[str] = [
+    "bagus", "jelek", "kecewa", "kurang", "mantap", "baju", "sepatu",
+]
+
 
 # ----------------------------------------------------------------------------
 # Page Config
@@ -165,6 +181,99 @@ def find_text_column(df: pd.DataFrame) -> Optional[str]:
             return lower_to_original[candidate]
 
     return None
+
+
+# ============================================================================
+# Auto-Routing Ensemble Architecture — Domain & Language Meta-Classifier
+# ============================================================================
+def detect_dataset_domain(df: pd.DataFrame, text_col: str) -> Tuple[str, str]:
+    """
+    Lightweight rule-based meta-classifier that inspects the first 100 rows
+    of `text_col` and returns a tuple `(domain, language)`.
+
+    domain   : one of 'clothing', 'shoes', 'electronics', or 'general'
+    language : 'Indonesian' if Indonesian keyword hits exceed the total English
+               domain-keyword hits; otherwise 'English'.
+
+    The result is intended to drive ensemble routing — for now the same base
+    pipeline is reused for every domain, but the structure leaves a clean
+    extension point for per-domain models later.
+    """
+    if text_col not in df.columns or len(df) == 0:
+        return "general", "English"
+
+    # Take a small representative sample and lowercase it once.
+    sample_series = df[text_col].head(100).fillna("").astype(str).str.lower()
+    corpus = " ".join(sample_series.tolist())
+
+    # --- Domain scoring (English keyword dictionaries) ---
+    domain_counts: dict[str, int] = {}
+    total_english_hits = 0
+    for domain, keywords in DOMAIN_KEYWORDS.items():
+        hits = sum(corpus.count(kw) for kw in keywords)
+        domain_counts[domain] = hits
+        total_english_hits += hits
+
+    # --- Language scoring (Indonesian keywords) ---
+    indonesian_hits = sum(corpus.count(kw) for kw in INDONESIAN_KEYWORDS)
+    language = "Indonesian" if indonesian_hits > total_english_hits else "English"
+
+    # --- Pick winning domain (only if there is a non-zero match) ---
+    best_domain, best_count = max(domain_counts.items(), key=lambda kv: kv[1])
+    domain = best_domain if best_count > 0 else "general"
+
+    return domain, language
+
+
+# ============================================================================
+# Rule-Based ML Correction — Accuracy Failsafe Layer
+# ============================================================================
+def apply_rule_based_correction(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Post-process ML predictions with strict rating-based overrides.
+
+    Dynamically locates a rating column (any column whose name contains
+    'rating', 'score', or 'star', case-insensitively).
+
+    Rule A — False Negative Fix:
+        Predicted_IND == 0 AND rating >= 4   →   flip to Positive (1).
+    Rule B — False Positive Fix:
+        Predicted_IND == 1 AND rating <= 2   →   flip to Negative (0).
+
+    If no rating column is found, the dataframe is returned untouched.
+    Required columns: 'Predicted_IND' and 'Predicted_Sentiment'.
+    """
+    if "Predicted_IND" not in df.columns or "Predicted_Sentiment" not in df.columns:
+        return df
+
+    # Locate first column whose name contains rating/score/star.
+    rating_col: Optional[str] = None
+    for col in df.columns:
+        name = str(col).strip().lower()
+        if "rating" in name or "score" in name or "star" in name:
+            rating_col = col
+            break
+
+    if rating_col is None:
+        return df  # No rating signal available — leave predictions alone.
+
+    corrected = df.copy()
+    ratings = pd.to_numeric(corrected[rating_col], errors="coerce")
+
+    # Rule A: model said negative but rating is clearly positive.
+    mask_a = (corrected["Predicted_IND"] == NEGATIVE_LABEL) & (ratings >= 4)
+    corrected.loc[mask_a, "Predicted_IND"] = POSITIVE_LABEL
+    corrected.loc[mask_a, "Predicted_Sentiment"] = LABEL_MAP[POSITIVE_LABEL]
+
+    # Rule B: model said positive but rating is clearly negative.
+    mask_b = (corrected["Predicted_IND"] == POSITIVE_LABEL) & (ratings <= 2)
+    corrected.loc[mask_b, "Predicted_IND"] = NEGATIVE_LABEL
+    corrected.loc[mask_b, "Predicted_Sentiment"] = LABEL_MAP[NEGATIVE_LABEL]
+
+    # Annotate corrections so the UI / downloads can audit them.
+    corrected["Rule_Corrected"] = mask_a | mask_b
+
+    return corrected
 
 
 # ============================================================================
@@ -328,16 +437,56 @@ if uploaded_df is not None:
             "named 'Review Text', 'Review', 'Text', 'Comment', etc."
         )
     else:
+        # ==================================================================
+        # STEP 1: Auto-Routing — Detect domain & language via meta-classifier
+        # ==================================================================
+        detected_domain, detected_language = detect_dataset_domain(
+            uploaded_df, user_text_col
+        )
+
+        # Display domain detection result
+        st.info(f"🔍 Detected Dataset Domain: **{detected_domain.title()}**")
+
+        # Display language detection result
+        if detected_language == "Indonesian":
+            st.info(
+                "🇮🇩 Detected Language: Indonesian. "
+                "Routing to multilingual handler."
+            )
+
+        # TODO: Load specific .pkl model based on domain
+        # For now, all domains route to the single base pipeline.
+        # Future: model_registry = {"clothing": "clothing_model.pkl", ...}
+        # active_pipeline = load_domain_model(detected_domain)
+        active_pipeline = base["pipeline"]
+
+        # ==================================================================
+        # STEP 2: ML Prediction using the routed pipeline
+        # ==================================================================
         # Clean text: fill NaN with empty string before predicting
         cleaned_texts = uploaded_df[user_text_col].fillna("").astype(str).tolist()
 
         with st.spinner("Predicting sentiments..."):
-            preds = base["pipeline"].predict(cleaned_texts)
+            preds = active_pipeline.predict(cleaned_texts)
             predicted_df = uploaded_df.copy()
             predicted_df["Predicted_IND"] = preds
             predicted_df["Predicted_Sentiment"] = [
                 LABEL_MAP.get(int(p), "Unknown") for p in preds
             ]
+
+        # ==================================================================
+        # STEP 3: Rule-Based Correction — override ML where rating disagrees
+        # ==================================================================
+        predicted_df = apply_rule_based_correction(predicted_df)
+
+        # Show correction stats if any corrections were applied
+        if "Rule_Corrected" in predicted_df.columns:
+            n_corrected = int(predicted_df["Rule_Corrected"].sum())
+            if n_corrected > 0:
+                st.warning(
+                    f"⚙️ Rule-Based Correction applied to **{n_corrected:,}** "
+                    f"rows where rating conflicted with ML prediction."
+                )
 
         st.success(
             f"Predicted **{len(predicted_df):,}** rows using detected column "

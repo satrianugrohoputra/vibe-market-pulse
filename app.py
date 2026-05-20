@@ -140,10 +140,16 @@ def train_base_pipeline() -> dict:
     y_pred = pipeline.predict(X_test)
 
     accuracy = accuracy_score(y_test, y_pred)
-    report = classification_report(
+    report_text = classification_report(
         y_test, y_pred,
         target_names=["Negative (0)", "Positive (1)"],
         zero_division=0,
+    )
+    report_dict = classification_report(
+        y_test, y_pred,
+        target_names=["Negative (0)", "Positive (1)"],
+        zero_division=0,
+        output_dict=True,
     )
 
     base_negatives = [
@@ -154,11 +160,126 @@ def train_base_pipeline() -> dict:
     return {
         "pipeline": pipeline,
         "accuracy": accuracy,
-        "report": report,
+        "report": report_text,
+        "report_dict": report_dict,
         "classes": ["Negative", "Positive"],
         "base_negative_samples": base_negatives,
         "n_train": len(X_train),
         "n_test": len(X_test),
+        "domain": "clothing",
+    }
+
+
+# ============================================================================
+# Dynamic Domain Pipeline — Trains on-the-fly from uploaded data
+# ============================================================================
+def train_domain_pipeline(
+    df: pd.DataFrame,
+    text_col: str,
+    domain: str,
+) -> Optional[dict]:
+    """
+    Train a TF-IDF + Logistic Regression pipeline dynamically from an uploaded
+    dataset. Uses the rating column to generate binary labels:
+        rating >= 4 → Positive (1)
+        rating <= 2 → Negative (0)
+        rating == 3 → excluded (ambiguous)
+
+    Returns a dict with the same structure as train_base_pipeline(), or None
+    if the dataset lacks a usable rating column or has insufficient labeled data.
+    """
+    # --- Find rating column ---
+    rating_col: Optional[str] = None
+    for col in df.columns:
+        name = str(col).strip().lower()
+        if "rating" in name or "score" in name or "star" in name:
+            rating_col = col
+            break
+
+    if rating_col is None:
+        return None  # Cannot train without rating signal
+
+    # --- Build labeled subset ---
+    work = df[[text_col, rating_col]].copy()
+    work[text_col] = work[text_col].fillna("").astype(str)
+    work[rating_col] = pd.to_numeric(work[rating_col], errors="coerce")
+    work = work.dropna(subset=[rating_col])
+
+    # Derive binary labels from rating
+    work["_label"] = -1  # placeholder
+    work.loc[work[rating_col] >= 4, "_label"] = POSITIVE_LABEL
+    work.loc[work[rating_col] <= 2, "_label"] = NEGATIVE_LABEL
+
+    # Drop ambiguous (rating == 3) and empty text
+    work = work[work["_label"].isin([0, 1])].reset_index(drop=True)
+    work = work[work[text_col].str.strip().astype(bool)].reset_index(drop=True)
+
+    if len(work) < 20:
+        return None  # Not enough data to train a meaningful model
+
+    X = work[text_col].tolist()
+    y = work["_label"].astype(int).tolist()
+
+    # Check class balance — need at least 2 of each class
+    from collections import Counter
+    counts = Counter(y)
+    if counts.get(0, 0) < 2 or counts.get(1, 0) < 2:
+        return None
+
+    # Stratified split
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.20, random_state=42, stratify=y,
+        )
+    except ValueError:
+        return None  # Stratification impossible
+
+    pipeline = Pipeline([
+        ("tfidf", TfidfVectorizer(
+            ngram_range=(1, 2),
+            min_df=2,
+            max_df=0.95,
+            sublinear_tf=True,
+        )),
+        ("clf", LogisticRegression(
+            max_iter=1000,
+            C=1.0,
+            class_weight="balanced",
+            random_state=42,
+        )),
+    ])
+
+    pipeline.fit(X_train, y_train)
+    y_pred = pipeline.predict(X_test)
+
+    accuracy = accuracy_score(y_test, y_pred)
+    report_text = classification_report(
+        y_test, y_pred,
+        target_names=["Negative (0)", "Positive (1)"],
+        zero_division=0,
+    )
+    report_dict = classification_report(
+        y_test, y_pred,
+        target_names=["Negative (0)", "Positive (1)"],
+        zero_division=0,
+        output_dict=True,
+    )
+
+    neg_samples = [
+        X_test[i] for i in range(len(X_test))
+        if y_pred[i] == NEGATIVE_LABEL and str(X_test[i]).strip()
+    ]
+
+    return {
+        "pipeline": pipeline,
+        "accuracy": accuracy,
+        "report": report_text,
+        "report_dict": report_dict,
+        "classes": ["Negative", "Positive"],
+        "base_negative_samples": neg_samples,
+        "n_train": len(X_train),
+        "n_test": len(X_test),
+        "domain": domain,
     }
 
 
@@ -413,12 +534,268 @@ def call_gemini_consultant(
 
 
 # ============================================================================
-# UI
+# UI — Premium SaaS Design (Indigo Light Mode)
 # ============================================================================
-st.title("🛍️ Hybrid E-Commerce Sentiment Analyzer")
-st.caption(
-    "Traditional ML (TF-IDF + Logistic Regression) **+** Generative AI "
-    f"(Gemini 2.5 Flash) for actionable business insights."
+GLOBAL_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+/* === Base / Background === */
+html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"] {
+    font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+}
+.stApp { background-color: #F8F9FA !important; }
+[data-testid="stHeader"] { background: transparent !important; }
+
+/* === Typography === */
+h1, h2, h3, h4 { color: #111827 !important; font-weight: 700 !important; letter-spacing: -0.02em; }
+h2 { font-size: 1.5rem !important; }
+h3 { font-size: 1.2rem !important; }
+
+/* === Hero header === */
+.kiro-hero { padding: 4px 0 8px; margin-bottom: 18px; }
+.kiro-hero-title {
+    font-size: 2.2rem !important;
+    font-weight: 800 !important;
+    margin: 0 0 6px 0 !important;
+    color: #111827 !important;
+}
+.kiro-hero-sub {
+    font-size: 0.95rem;
+    color: #6B7280;
+    margin: 0;
+    line-height: 1.55;
+}
+
+/* === Sidebar === */
+[data-testid="stSidebar"] {
+    background-color: #FFFFFF !important;
+    border-right: 1px solid #E5E7EB !important;
+}
+[data-testid="stSidebar"] > div:first-child { padding-top: 6px; }
+
+.kiro-logo {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 18px 14px 4px 14px;
+    color: #6366F1;
+    font-size: 1.35rem;
+    font-weight: 800;
+    letter-spacing: -0.5px;
+}
+.kiro-logo-version {
+    font-size: 0.7rem;
+    color: #9CA3AF;
+    font-weight: 500;
+    letter-spacing: 0.2px;
+}
+
+.kiro-nav { display: flex; flex-direction: column; gap: 2px; padding: 6px 12px 12px; }
+.kiro-nav a {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px;
+    border-radius: 8px;
+    color: #4B5563;
+    text-decoration: none !important;
+    font-weight: 500;
+    font-size: 0.92rem;
+    transition: all 0.15s ease;
+}
+.kiro-nav a:hover {
+    background-color: #EEF2FF;
+    color: #4F46E5;
+}
+
+.kiro-sidebar-card {
+    margin: 12px;
+    padding: 14px 16px;
+    background-color: #F9FAFB;
+    border: 1px solid #E5E7EB;
+    border-radius: 10px;
+}
+.kiro-sidebar-card-title {
+    font-weight: 600;
+    font-size: 0.88rem;
+    color: #111827;
+    margin-bottom: 6px;
+}
+.kiro-sidebar-card-text {
+    font-size: 0.78rem;
+    color: #6B7280;
+    line-height: 1.45;
+    margin-bottom: 6px;
+}
+
+/* === Premium metric cards === */
+.kiro-metric-card {
+    background-color: #FFFFFF;
+    border-radius: 12px;
+    border: 1px solid #E5E7EB;
+    padding: 18px 22px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    transition: transform 0.18s ease, box-shadow 0.18s ease;
+    height: 100%;
+}
+.kiro-metric-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px rgba(79,70,229,0.10);
+}
+.kiro-metric-label {
+    font-size: 0.78rem;
+    color: #6B7280;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    margin-bottom: 6px;
+}
+.kiro-metric-value {
+    font-size: 2.25rem;
+    font-weight: 800;
+    line-height: 1.15;
+    color: #4F46E5;
+}
+
+/* === Buttons (primary indigo) === */
+.stButton > button, .stDownloadButton > button {
+    border-radius: 8px !important;
+    padding: 0.55em 1.2em !important;
+    font-weight: 600 !important;
+    transition: all 0.18s ease !important;
+    border: 1px solid transparent !important;
+}
+.stButton > button[kind="primary"],
+.stButton > button[data-testid="baseButton-primary"] {
+    background-color: #4F46E5 !important;
+    color: #FFFFFF !important;
+    border: 1px solid #4F46E5 !important;
+}
+.stButton > button[kind="primary"]:hover,
+.stButton > button[data-testid="baseButton-primary"]:hover {
+    background-color: #4338CA !important;
+    border-color: #4338CA !important;
+    transform: translateY(-1px) scale(1.01);
+    box-shadow: 0 6px 14px rgba(79,70,229,0.25) !important;
+}
+.stButton > button:not([kind="primary"]):not([data-testid="baseButton-primary"]) {
+    background-color: #FFFFFF !important;
+    color: #374151 !important;
+    border: 1px solid #E5E7EB !important;
+}
+.stButton > button:not([kind="primary"]):not([data-testid="baseButton-primary"]):hover {
+    background-color: #F3F4F6 !important;
+    border-color: #D1D5DB !important;
+}
+.stDownloadButton > button {
+    background-color: #FFFFFF !important;
+    color: #4F46E5 !important;
+    border: 1px solid #C7D2FE !important;
+}
+.stDownloadButton > button:hover {
+    background-color: #EEF2FF !important;
+    border-color: #A5B4FC !important;
+}
+
+/* === Alerts (info / warning / success / error) === */
+[data-testid="stAlert"] {
+    border-radius: 10px !important;
+    padding: 12px 16px !important;
+    border: 1px solid !important;
+    box-shadow: none !important;
+}
+
+/* === File uploader === */
+[data-testid="stFileUploader"] section {
+    border-radius: 10px !important;
+    border: 1px dashed #C7D2FE !important;
+    background-color: #F5F7FF !important;
+}
+[data-testid="stFileUploader"] button {
+    background-color: #4F46E5 !important;
+    color: #FFFFFF !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+    border: none !important;
+}
+[data-testid="stFileUploader"] button:hover {
+    background-color: #4338CA !important;
+}
+
+/* === Inputs === */
+[data-testid="stTextInput"] input,
+[data-testid="stSelectbox"] > div > div,
+[data-baseweb="select"] > div {
+    border-radius: 8px !important;
+    border-color: #E5E7EB !important;
+}
+[data-testid="stTextInput"] input:focus {
+    border-color: #6366F1 !important;
+    box-shadow: 0 0 0 2px rgba(99,102,241,0.18) !important;
+}
+
+/* === Expander === */
+[data-testid="stExpander"] {
+    border-radius: 12px !important;
+    border: 1px solid #E5E7EB !important;
+    background-color: #FFFFFF !important;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+
+/* === Divider === */
+hr { border-color: #E5E7EB !important; opacity: 0.6 !important; }
+
+/* === Dataframe === */
+[data-testid="stDataFrame"] {
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid #E5E7EB;
+}
+
+/* === Section anchors (invisible offset) === */
+.kiro-anchor {
+    display: block;
+    position: relative;
+    top: -50px;
+    visibility: hidden;
+}
+
+/* === Footer === */
+.kiro-footer {
+    text-align: center;
+    color: #9CA3AF;
+    font-size: 0.8rem;
+    padding: 24px 0 10px;
+    border-top: 1px solid #E5E7EB;
+    margin-top: 32px;
+}
+</style>
+"""
+
+
+def render_metric_html(label: str, value: str, color: str = "#4F46E5") -> str:
+    """Render a premium metric card as HTML for st.markdown injection."""
+    return (
+        '<div class="kiro-metric-card">'
+        f'<div class="kiro-metric-label">{label}</div>'
+        f'<div class="kiro-metric-value" style="color: {color};">{value}</div>'
+        '</div>'
+    )
+
+
+# --- Inject global CSS once ---
+st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
+
+# --- Hero header (with #dashboard anchor) ---
+st.markdown(
+    '<a id="dashboard" class="kiro-anchor"></a>'
+    '<div class="kiro-hero">'
+    '<div class="kiro-hero-title">🛍️ Hybrid E-Commerce Sentiment Analyzer</div>'
+    '<p class="kiro-hero-sub">Traditional ML (TF-IDF + Logistic Regression) '
+    '<strong>+</strong> Auto-Routing Domain Detection <strong>+</strong> '
+    'Rule-Based ML Correction <strong>+</strong> Generative AI (Gemini) '
+    'for actionable business insights.</p>'
+    '</div>',
+    unsafe_allow_html=True,
 )
 
 # --- Train Base Model ---
@@ -434,61 +811,125 @@ except Exception as exc:
     st.error(f"Failed to train base model: {exc}")
     st.stop()
 
-# --- Sidebar ---
+# --- Sidebar (premium SaaS layout) ---
 with st.sidebar:
-    st.header("📂 Upload New Reviews")
+    # Brand logo + version
     st.markdown(
-        "Upload a CSV with a text column. We'll auto-detect any of: "
-        "`Review Text`, `Review`, `Text`, `Comment`, `Content`, `Description`."
+        '<div class="kiro-logo">📊 Market Insights'
+        '<span class="kiro-logo-version">v2.4.0</span></div>',
+        unsafe_allow_html=True,
     )
-    uploaded_file = st.file_uploader("Drop a CSV file", type=["csv"])
 
-    st.divider()
-    st.subheader("🔑 Gemini Status")
+    # Navigation links (jump to section anchors)
+    st.markdown(
+        '<nav class="kiro-nav">'
+        '<a href="#dashboard">🏠 Dashboard</a>'
+        '<a href="#model-performance">📈 Model Performance</a>'
+        '<a href="#sentiments">🔍 Sentiments</a>'
+        '<a href="#ai-consultant">🤖 AI Consultant</a>'
+        '</nav>',
+        unsafe_allow_html=True,
+    )
+
+    # Upload card (visual frame around uploader)
+    st.markdown(
+        '<div class="kiro-sidebar-card">'
+        '<div class="kiro-sidebar-card-title">📂 Upload CSV</div>'
+        '<div class="kiro-sidebar-card-text">Upload a CSV with a text column. '
+        "We&#39;ll auto-detect.</div></div>",
+        unsafe_allow_html=True,
+    )
+    uploaded_file = st.file_uploader(
+        "Drop a CSV file", type=["csv"], label_visibility="collapsed"
+    )
+
+    st.markdown('<hr/>', unsafe_allow_html=True)
+
+    # Gemini status
+    st.markdown('**🔑 Gemini Status**')
     api_key, api_err = get_gemini_api_key()
     if api_key:
         st.success("API key loaded.")
     else:
         st.warning(api_err)
 
-    st.divider()
+    st.markdown('<hr/>', unsafe_allow_html=True)
     st.markdown(
         "**Tech Stack**\n"
         "- scikit-learn (TF-IDF + LogReg)\n"
         "- Pandas / Plotly\n"
-        f"- Google GenAI SDK (GEMINI_MODEL)"
+        "- Google GenAI SDK"
     )
 
-# --- Model Performance ---
-st.subheader("📈 Model Performance (Base Dataset + Hybrid Pipeline)")
-st.caption(
-    "Base ML accuracy shown below. Uploaded data benefits from additional "
-    "**Auto-Routing** (domain/language detection) and **Rule-Based Correction** "
-    "(rating override) layers that improve effective accuracy beyond this baseline."
-)
+# --- Model Performance (dynamic — updated when domain pipeline trains) ---
+# We use a placeholder approach: show base metrics initially, then override
+# with domain-specific metrics if an uploaded dataset trains successfully.
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Base Accuracy", f"{base['accuracy'] * 100:.2f}%")
-col2.metric("Train Size", base["n_train"])
-col3.metric("Test Size", base["n_test"])
-col4.metric("Classes", len(base["classes"]))
+# Initialize active_eval to the base pipeline stats (default view)
+active_eval: dict = base
 
-with st.expander("📋 Classification Report & Pipeline Info", expanded=False):
-    st.code(base["report"], language="text")
+def render_model_performance(eval_data: dict) -> None:
+    """Render the Model Performance section dynamically with premium cards."""
+    domain_label = eval_data.get("domain", "clothing").title()
     st.markdown(
-        f"**Base Model**: TF-IDF (bigrams) + Logistic Regression\n\n"
-        f"**Text column**: `{TEXT_COL}` · **Target**: `{TARGET_COL}` (1=Positive, 0=Negative)\n\n"
-        f"**Enhancement Layers** (applied on user uploads):\n"
-        f"1. 🔍 Auto-Routing — detects domain (clothing/shoes/electronics) & language (EN/ID)\n"
-        f"2. ⚙️ Rule-Based Correction — overrides ML when star rating strongly disagrees\n"
-        f"3. 🤖 Gemini AI — domain-aware prompt engineering for business insights"
+        '<a id="model-performance" class="kiro-anchor"></a>',
+        unsafe_allow_html=True,
     )
+    st.subheader("📈 Model Performance (Base Dataset + Hybrid Pipeline)")
+    st.caption(
+        "Base ML accuracy shown below. Uploaded data benefits from additional "
+        "**Auto-Routing** (domain/language detection) and **Rule-Based Correction** "
+        "(rating override) layers that improve effective accuracy beyond this baseline."
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(
+            render_metric_html(
+                "Base Accuracy",
+                f"{eval_data['accuracy'] * 100:.2f}%",
+                color="#059669",  # Emerald green for accuracy
+            ),
+            unsafe_allow_html=True,
+        )
+    with col2:
+        st.markdown(
+            render_metric_html("Train Size", f"{eval_data['n_train']:,}"),
+            unsafe_allow_html=True,
+        )
+    with col3:
+        st.markdown(
+            render_metric_html("Test Size", f"{eval_data['n_test']:,}"),
+            unsafe_allow_html=True,
+        )
+    with col4:
+        st.markdown(
+            render_metric_html("Classes", str(len(eval_data["classes"]))),
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("📋 Classification Report & Pipeline Info", expanded=False):
+        st.code(eval_data["report"], language="text")
+        st.markdown(
+            f"**Base Model**: TF-IDF (bigrams) + Logistic Regression "
+            f"(**{domain_label}** Optimized)\n\n"
+            f"**Enhancement Layers** (applied on user uploads):\n"
+            f"1. 🔍 Auto-Routing — detects domain (clothing/shoes/electronics) & language (EN/ID)\n"
+            f"2. ⚙️ Rule-Based Correction — overrides ML when star rating strongly disagrees\n"
+            f"3. 🤖 Gemini AI — domain-aware prompt engineering for business insights"
+        )
+
+# Render initial (base) performance — will be overridden below if domain trains
+_perf_placeholder = st.empty()
+with _perf_placeholder.container():
+    render_model_performance(active_eval)
 
 st.divider()
 
 # ============================================================================
 # User Upload & Predictions  (with interactive filters)
 # ============================================================================
+st.markdown('<a id="sentiments" class="kiro-anchor"></a>', unsafe_allow_html=True)
 st.subheader("🔍 Predict Sentiments on Your Data")
 
 uploaded_df: Optional[pd.DataFrame] = None
@@ -529,11 +970,32 @@ if uploaded_df is not None:
                 "Routing to multilingual handler."
             )
 
-        # TODO: Load specific .pkl model based on domain
-        # For now, all domains route to the single base pipeline.
-        # Future: model_registry = {"clothing": "clothing_model.pkl", ...}
-        # active_pipeline = load_domain_model(detected_domain)
-        active_pipeline = base["pipeline"]
+        # ==================================================================
+        # STEP 1b: Train domain-specific pipeline if rating column exists
+        # ==================================================================
+        domain_eval: Optional[dict] = None
+        with st.spinner(f"Training {detected_domain.title()} domain model..."):
+            domain_eval = train_domain_pipeline(
+                uploaded_df, user_text_col, detected_domain
+            )
+
+        if domain_eval is not None:
+            # Domain pipeline trained successfully — use it for predictions
+            active_pipeline = domain_eval["pipeline"]
+            active_eval = domain_eval
+            st.success(
+                f"🎯 Domain-specific model trained on uploaded data! "
+                f"Accuracy: **{domain_eval['accuracy'] * 100:.2f}%** "
+                f"(Train: {domain_eval['n_train']:,} · Test: {domain_eval['n_test']:,})"
+            )
+        else:
+            # Fallback to base pipeline (no rating column or insufficient data)
+            active_pipeline = base["pipeline"]
+            active_eval = base
+
+        # --- Render dynamic Model Performance with active eval ---
+        with _perf_placeholder.container():
+            render_model_performance(active_eval)
 
         # ==================================================================
         # STEP 2: ML Prediction using the routed pipeline
@@ -809,6 +1271,7 @@ model_name = selected_model
 # ============================================================================
 # Gemini AI Consultant — Domain-Aware Aspect-Based Business Intelligence
 # ============================================================================
+st.markdown('<a id="ai-consultant" class="kiro-anchor"></a>', unsafe_allow_html=True)
 st.subheader("🤖 Ask AI Consultant (Domain-Aware Aspect Analysis)")
 st.markdown(
     "Generate an executive **aspect-based** report from negative reviews. "
@@ -896,8 +1359,8 @@ if trigger:
                     st.markdown(output)
 
 # --- Footer ---
-st.divider()
-st.caption(
-    "Built with Streamlit · scikit-learn · Google GenAI SDK · "
-    "Hybrid ML + GenAI architecture."
+st.markdown(
+    '<div class="kiro-footer">Built with Streamlit · scikit-learn · '
+    'Google GenAI SDK · Hybrid ML + GenAI architecture.</div>',
+    unsafe_allow_html=True,
 )

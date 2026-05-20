@@ -2,7 +2,7 @@
 Hybrid E-Commerce Sentiment Analyzer
 ====================================
 A Streamlit app that combines a Traditional NLP ML pipeline (TF-IDF + Logistic
-Regression) with Generative AI (Gemini 2.5 Flash) for executive-level insights
+Regression) with Generative AI (Gemini Flash Model) for executive-level insights
 on e-commerce review datasets.
 
 Base dataset columns (Women's E-Commerce Clothing Reviews):
@@ -1257,8 +1257,12 @@ st.divider()
 # Gemini model — using current stable, widely-available model on the Gemini
 selected_model = st.selectbox(
     "Pilih Model AI Google (Free Tier):",
-    ["gemini-2.5-flash", "gemini-3.1-flash-lite"],
-    index=0
+    [
+        "gemini-3.1-flash-lite",  # Sangat hemat (500 Requests/Day), cocok buat testing berkali-kali
+        "gemini-2.5-flash",       
+        "gemini-3.5-flash"       
+    ],
+    index=0  # Default diarahkan ke 3.1-flash-lite agar aman dari hit limit saat aplikasi pertama run
 )
 
 GEMINI_MODEL = selected_model

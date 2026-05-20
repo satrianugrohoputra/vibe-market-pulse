@@ -2,7 +2,7 @@
 Hybrid E-Commerce Sentiment Analyzer
 ====================================
 A Streamlit app that combines a Traditional NLP ML pipeline (TF-IDF + Logistic
-Regression) with Generative AI (Gemini 2.5 Flash) for executive-level insights
+Regression) with Generative AI (Gemini Flash Model) for executive-level insights
 on e-commerce review datasets.
 
 Base dataset columns (Women's E-Commerce Clothing Reviews):
@@ -186,7 +186,7 @@ def get_gemini_api_key() -> Tuple[Optional[str], Optional[str]]:
         return None, f"Could not read secrets: {exc}"
 
 
-def call_gemini_consultant(api_key: str, negative_reviews: list[str], model_name: str = "gemini-2.5-flash") -> str:
+def call_gemini_consultant(api_key: str, negative_reviews: list[str], model_name: str = "gemini-3.1-flash-lite") -> str:
     """
     Send negative reviews to Gemini and request an aspect-based business
     intelligence summary dynamically using the selected model.
@@ -243,7 +243,7 @@ def call_gemini_consultant(api_key: str, negative_reviews: list[str], model_name
 st.title("🛍️ Hybrid E-Commerce Sentiment Analyzer")
 st.caption(
     "Traditional ML (TF-IDF + Logistic Regression) **+** Generative AI "
-    f"(Gemini 2.5 Flash) for actionable business insights."
+    f"(Gemini Flash Model) for actionable business insights."
 )
 
 # --- Train Base Model ---
@@ -463,8 +463,12 @@ st.divider()
 # Gemini model — using current stable, widely-available model on the Gemini
 selected_model = st.selectbox(
     "Pilih Model AI Google (Free Tier):",
-    ["gemini-2.5-flash", "gemini-3.1-flash-lite"],
-    index=0
+    [
+        "gemini-3.1-flash-lite",  # Sangat hemat (500 Requests/Day), cocok buat testing berkali-kali
+        "gemini-2.5-flash",       
+        "gemini-3.5-flash"       
+    ],
+    index=0  # Default diarahkan ke 3.1-flash-lite agar aman dari hit limit saat aplikasi pertama run
 )
 
 GEMINI_MODEL = selected_model

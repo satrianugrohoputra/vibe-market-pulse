@@ -534,12 +534,268 @@ def call_gemini_consultant(
 
 
 # ============================================================================
-# UI
+# UI — Premium SaaS Design (Indigo Light Mode)
 # ============================================================================
-st.title("🛍️ Hybrid E-Commerce Sentiment Analyzer")
-st.caption(
-    "Traditional ML (TF-IDF + Logistic Regression) **+** Auto-Routing Domain Detection "
-    "**+** Rule-Based ML Correction **+** Generative AI (Gemini) for actionable business insights."
+GLOBAL_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+/* === Base / Background === */
+html, body, [class*="css"], .stApp, [data-testid="stAppViewContainer"] {
+    font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+}
+.stApp { background-color: #F8F9FA !important; }
+[data-testid="stHeader"] { background: transparent !important; }
+
+/* === Typography === */
+h1, h2, h3, h4 { color: #111827 !important; font-weight: 700 !important; letter-spacing: -0.02em; }
+h2 { font-size: 1.5rem !important; }
+h3 { font-size: 1.2rem !important; }
+
+/* === Hero header === */
+.kiro-hero { padding: 4px 0 8px; margin-bottom: 18px; }
+.kiro-hero-title {
+    font-size: 2.2rem !important;
+    font-weight: 800 !important;
+    margin: 0 0 6px 0 !important;
+    color: #111827 !important;
+}
+.kiro-hero-sub {
+    font-size: 0.95rem;
+    color: #6B7280;
+    margin: 0;
+    line-height: 1.55;
+}
+
+/* === Sidebar === */
+[data-testid="stSidebar"] {
+    background-color: #FFFFFF !important;
+    border-right: 1px solid #E5E7EB !important;
+}
+[data-testid="stSidebar"] > div:first-child { padding-top: 6px; }
+
+.kiro-logo {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 18px 14px 4px 14px;
+    color: #6366F1;
+    font-size: 1.35rem;
+    font-weight: 800;
+    letter-spacing: -0.5px;
+}
+.kiro-logo-version {
+    font-size: 0.7rem;
+    color: #9CA3AF;
+    font-weight: 500;
+    letter-spacing: 0.2px;
+}
+
+.kiro-nav { display: flex; flex-direction: column; gap: 2px; padding: 6px 12px 12px; }
+.kiro-nav a {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px;
+    border-radius: 8px;
+    color: #4B5563;
+    text-decoration: none !important;
+    font-weight: 500;
+    font-size: 0.92rem;
+    transition: all 0.15s ease;
+}
+.kiro-nav a:hover {
+    background-color: #EEF2FF;
+    color: #4F46E5;
+}
+
+.kiro-sidebar-card {
+    margin: 12px;
+    padding: 14px 16px;
+    background-color: #F9FAFB;
+    border: 1px solid #E5E7EB;
+    border-radius: 10px;
+}
+.kiro-sidebar-card-title {
+    font-weight: 600;
+    font-size: 0.88rem;
+    color: #111827;
+    margin-bottom: 6px;
+}
+.kiro-sidebar-card-text {
+    font-size: 0.78rem;
+    color: #6B7280;
+    line-height: 1.45;
+    margin-bottom: 6px;
+}
+
+/* === Premium metric cards === */
+.kiro-metric-card {
+    background-color: #FFFFFF;
+    border-radius: 12px;
+    border: 1px solid #E5E7EB;
+    padding: 18px 22px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    transition: transform 0.18s ease, box-shadow 0.18s ease;
+    height: 100%;
+}
+.kiro-metric-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 16px rgba(79,70,229,0.10);
+}
+.kiro-metric-label {
+    font-size: 0.78rem;
+    color: #6B7280;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    margin-bottom: 6px;
+}
+.kiro-metric-value {
+    font-size: 2.25rem;
+    font-weight: 800;
+    line-height: 1.15;
+    color: #4F46E5;
+}
+
+/* === Buttons (primary indigo) === */
+.stButton > button, .stDownloadButton > button {
+    border-radius: 8px !important;
+    padding: 0.55em 1.2em !important;
+    font-weight: 600 !important;
+    transition: all 0.18s ease !important;
+    border: 1px solid transparent !important;
+}
+.stButton > button[kind="primary"],
+.stButton > button[data-testid="baseButton-primary"] {
+    background-color: #4F46E5 !important;
+    color: #FFFFFF !important;
+    border: 1px solid #4F46E5 !important;
+}
+.stButton > button[kind="primary"]:hover,
+.stButton > button[data-testid="baseButton-primary"]:hover {
+    background-color: #4338CA !important;
+    border-color: #4338CA !important;
+    transform: translateY(-1px) scale(1.01);
+    box-shadow: 0 6px 14px rgba(79,70,229,0.25) !important;
+}
+.stButton > button:not([kind="primary"]):not([data-testid="baseButton-primary"]) {
+    background-color: #FFFFFF !important;
+    color: #374151 !important;
+    border: 1px solid #E5E7EB !important;
+}
+.stButton > button:not([kind="primary"]):not([data-testid="baseButton-primary"]):hover {
+    background-color: #F3F4F6 !important;
+    border-color: #D1D5DB !important;
+}
+.stDownloadButton > button {
+    background-color: #FFFFFF !important;
+    color: #4F46E5 !important;
+    border: 1px solid #C7D2FE !important;
+}
+.stDownloadButton > button:hover {
+    background-color: #EEF2FF !important;
+    border-color: #A5B4FC !important;
+}
+
+/* === Alerts (info / warning / success / error) === */
+[data-testid="stAlert"] {
+    border-radius: 10px !important;
+    padding: 12px 16px !important;
+    border: 1px solid !important;
+    box-shadow: none !important;
+}
+
+/* === File uploader === */
+[data-testid="stFileUploader"] section {
+    border-radius: 10px !important;
+    border: 1px dashed #C7D2FE !important;
+    background-color: #F5F7FF !important;
+}
+[data-testid="stFileUploader"] button {
+    background-color: #4F46E5 !important;
+    color: #FFFFFF !important;
+    border-radius: 6px !important;
+    font-weight: 600 !important;
+    border: none !important;
+}
+[data-testid="stFileUploader"] button:hover {
+    background-color: #4338CA !important;
+}
+
+/* === Inputs === */
+[data-testid="stTextInput"] input,
+[data-testid="stSelectbox"] > div > div,
+[data-baseweb="select"] > div {
+    border-radius: 8px !important;
+    border-color: #E5E7EB !important;
+}
+[data-testid="stTextInput"] input:focus {
+    border-color: #6366F1 !important;
+    box-shadow: 0 0 0 2px rgba(99,102,241,0.18) !important;
+}
+
+/* === Expander === */
+[data-testid="stExpander"] {
+    border-radius: 12px !important;
+    border: 1px solid #E5E7EB !important;
+    background-color: #FFFFFF !important;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+}
+
+/* === Divider === */
+hr { border-color: #E5E7EB !important; opacity: 0.6 !important; }
+
+/* === Dataframe === */
+[data-testid="stDataFrame"] {
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid #E5E7EB;
+}
+
+/* === Section anchors (invisible offset) === */
+.kiro-anchor {
+    display: block;
+    position: relative;
+    top: -50px;
+    visibility: hidden;
+}
+
+/* === Footer === */
+.kiro-footer {
+    text-align: center;
+    color: #9CA3AF;
+    font-size: 0.8rem;
+    padding: 24px 0 10px;
+    border-top: 1px solid #E5E7EB;
+    margin-top: 32px;
+}
+</style>
+"""
+
+
+def render_metric_html(label: str, value: str, color: str = "#4F46E5") -> str:
+    """Render a premium metric card as HTML for st.markdown injection."""
+    return (
+        '<div class="kiro-metric-card">'
+        f'<div class="kiro-metric-label">{label}</div>'
+        f'<div class="kiro-metric-value" style="color: {color};">{value}</div>'
+        '</div>'
+    )
+
+
+# --- Inject global CSS once ---
+st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
+
+# --- Hero header (with #dashboard anchor) ---
+st.markdown(
+    '<a id="dashboard" class="kiro-anchor"></a>'
+    '<div class="kiro-hero">'
+    '<div class="kiro-hero-title">🛍️ Hybrid E-Commerce Sentiment Analyzer</div>'
+    '<p class="kiro-hero-sub">Traditional ML (TF-IDF + Logistic Regression) '
+    '<strong>+</strong> Auto-Routing Domain Detection <strong>+</strong> '
+    'Rule-Based ML Correction <strong>+</strong> Generative AI (Gemini) '
+    'for actionable business insights.</p>'
+    '</div>',
+    unsafe_allow_html=True,
 )
 
 # --- Train Base Model ---
@@ -555,29 +811,54 @@ except Exception as exc:
     st.error(f"Failed to train base model: {exc}")
     st.stop()
 
-# --- Sidebar ---
+# --- Sidebar (premium SaaS layout) ---
 with st.sidebar:
-    st.header("📂 Upload New Reviews")
+    # Brand logo + version
     st.markdown(
-        "Upload a CSV with a text column. We'll auto-detect any of: "
-        "`Review Text`, `Review`, `Text`, `Comment`, `Content`, `Description`."
+        '<div class="kiro-logo">📊 Market Insights'
+        '<span class="kiro-logo-version">v2.4.0</span></div>',
+        unsafe_allow_html=True,
     )
-    uploaded_file = st.file_uploader("Drop a CSV file", type=["csv"])
 
-    st.divider()
-    st.subheader("🔑 Gemini Status")
+    # Navigation links (jump to section anchors)
+    st.markdown(
+        '<nav class="kiro-nav">'
+        '<a href="#dashboard">🏠 Dashboard</a>'
+        '<a href="#model-performance">📈 Model Performance</a>'
+        '<a href="#sentiments">🔍 Sentiments</a>'
+        '<a href="#ai-consultant">🤖 AI Consultant</a>'
+        '</nav>',
+        unsafe_allow_html=True,
+    )
+
+    # Upload card (visual frame around uploader)
+    st.markdown(
+        '<div class="kiro-sidebar-card">'
+        '<div class="kiro-sidebar-card-title">📂 Upload CSV</div>'
+        '<div class="kiro-sidebar-card-text">Upload a CSV with a text column. '
+        "We&#39;ll auto-detect.</div></div>",
+        unsafe_allow_html=True,
+    )
+    uploaded_file = st.file_uploader(
+        "Drop a CSV file", type=["csv"], label_visibility="collapsed"
+    )
+
+    st.markdown('<hr/>', unsafe_allow_html=True)
+
+    # Gemini status
+    st.markdown('**🔑 Gemini Status**')
     api_key, api_err = get_gemini_api_key()
     if api_key:
         st.success("API key loaded.")
     else:
         st.warning(api_err)
 
-    st.divider()
+    st.markdown('<hr/>', unsafe_allow_html=True)
     st.markdown(
         "**Tech Stack**\n"
         "- scikit-learn (TF-IDF + LogReg)\n"
         "- Pandas / Plotly\n"
-        f"- Google GenAI SDK (GEMINI_MODEL)"
+        "- Google GenAI SDK"
     )
 
 # --- Model Performance (dynamic — updated when domain pipeline trains) ---
@@ -588,20 +869,44 @@ with st.sidebar:
 active_eval: dict = base
 
 def render_model_performance(eval_data: dict) -> None:
-    """Render the Model Performance section dynamically from eval_data dict."""
+    """Render the Model Performance section dynamically with premium cards."""
     domain_label = eval_data.get("domain", "clothing").title()
-    st.subheader(f"📈 Model Performance (Base Dataset + Hybrid Pipeline)")
+    st.markdown(
+        '<a id="model-performance" class="kiro-anchor"></a>',
+        unsafe_allow_html=True,
+    )
+    st.subheader("📈 Model Performance (Base Dataset + Hybrid Pipeline)")
     st.caption(
-        f"Base ML accuracy shown below. Uploaded data benefits from additional "
-        f"**Auto-Routing** (domain/language detection) and **Rule-Based Correction** "
-        f"(rating override) layers that improve effective accuracy beyond this baseline."
+        "Base ML accuracy shown below. Uploaded data benefits from additional "
+        "**Auto-Routing** (domain/language detection) and **Rule-Based Correction** "
+        "(rating override) layers that improve effective accuracy beyond this baseline."
     )
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Base Accuracy", f"{eval_data['accuracy'] * 100:.2f}%")
-    col2.metric("Train Size", eval_data["n_train"])
-    col3.metric("Test Size", eval_data["n_test"])
-    col4.metric("Classes", len(eval_data["classes"]))
+    with col1:
+        st.markdown(
+            render_metric_html(
+                "Base Accuracy",
+                f"{eval_data['accuracy'] * 100:.2f}%",
+                color="#059669",  # Emerald green for accuracy
+            ),
+            unsafe_allow_html=True,
+        )
+    with col2:
+        st.markdown(
+            render_metric_html("Train Size", f"{eval_data['n_train']:,}"),
+            unsafe_allow_html=True,
+        )
+    with col3:
+        st.markdown(
+            render_metric_html("Test Size", f"{eval_data['n_test']:,}"),
+            unsafe_allow_html=True,
+        )
+    with col4:
+        st.markdown(
+            render_metric_html("Classes", str(len(eval_data["classes"]))),
+            unsafe_allow_html=True,
+        )
 
     with st.expander("📋 Classification Report & Pipeline Info", expanded=False):
         st.code(eval_data["report"], language="text")
@@ -624,6 +929,7 @@ st.divider()
 # ============================================================================
 # User Upload & Predictions  (with interactive filters)
 # ============================================================================
+st.markdown('<a id="sentiments" class="kiro-anchor"></a>', unsafe_allow_html=True)
 st.subheader("🔍 Predict Sentiments on Your Data")
 
 uploaded_df: Optional[pd.DataFrame] = None
@@ -961,6 +1267,7 @@ model_name = selected_model
 # ============================================================================
 # Gemini AI Consultant — Domain-Aware Aspect-Based Business Intelligence
 # ============================================================================
+st.markdown('<a id="ai-consultant" class="kiro-anchor"></a>', unsafe_allow_html=True)
 st.subheader("🤖 Ask AI Consultant (Domain-Aware Aspect Analysis)")
 st.markdown(
     "Generate an executive **aspect-based** report from negative reviews. "
@@ -1048,8 +1355,8 @@ if trigger:
                     st.markdown(output)
 
 # --- Footer ---
-st.divider()
-st.caption(
-    "Built with Streamlit · scikit-learn · Google GenAI SDK · "
-    "Hybrid ML + GenAI architecture."
+st.markdown(
+    '<div class="kiro-footer">Built with Streamlit · scikit-learn · '
+    'Google GenAI SDK · Hybrid ML + GenAI architecture.</div>',
+    unsafe_allow_html=True,
 )

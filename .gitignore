@@ -50,3 +50,7 @@ ENV/
 .cache/
 .pytest_cache/
 .mypy_cache/
+
+# --- Agentic RAG local vector store cache ---
+chroma_db/
+.chroma/

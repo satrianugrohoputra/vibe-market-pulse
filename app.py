@@ -27,6 +27,13 @@ from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 
+# --- Internal modules: Vector store + LangGraph Agentic RAG ---
+from src.ai.vector_store import (
+    get_or_build_vector_store,
+    ReviewVectorStore,
+)
+from src.ai.agent_graph import run_agentic_rag
+
 # ----------------------------------------------------------------------------
 # Constants
 # ----------------------------------------------------------------------------
@@ -768,6 +775,51 @@ hr { border-color: #E5E7EB !important; opacity: 0.6 !important; }
     border-top: 1px solid #E5E7EB;
     margin-top: 32px;
 }
+
+/* === Smart Search result cards === */
+.kiro-search-result {
+    background-color: #FFFFFF;
+    border: 1px solid #E5E7EB;
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin-bottom: 10px;
+    transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+.kiro-search-result:hover {
+    border-color: #C7D2FE;
+    box-shadow: 0 4px 12px rgba(79,70,229,0.08);
+}
+.kiro-search-result-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    margin-bottom: 6px;
+}
+.kiro-search-rank {
+    color: #4F46E5;
+    background: #EEF2FF;
+    border-radius: 6px;
+    padding: 2px 8px;
+}
+.kiro-search-score {
+    color: #059669;
+    background: #ECFDF5;
+    border-radius: 6px;
+    padding: 2px 8px;
+}
+.kiro-search-sentiment {
+    font-weight: 700;
+}
+.kiro-search-rating {
+    color: #D97706;
+}
+.kiro-search-result-text {
+    color: #1F2937;
+    font-size: 0.92rem;
+    line-height: 1.5;
+}
 </style>
 """
 
@@ -826,6 +878,7 @@ with st.sidebar:
         '<a href="#dashboard">🏠 Dashboard</a>'
         '<a href="#model-performance">📈 Model Performance</a>'
         '<a href="#sentiments">🔍 Sentiments</a>'
+        '<a href="#smart-search">🧠 Smart Search</a>'
         '<a href="#ai-consultant">🤖 AI Consultant</a>'
         '</nav>',
         unsafe_allow_html=True,
@@ -935,6 +988,7 @@ st.subheader("🔍 Predict Sentiments on Your Data")
 uploaded_df: Optional[pd.DataFrame] = None
 predicted_df: Optional[pd.DataFrame] = None
 user_text_col: Optional[str] = None
+vector_store: Optional[ReviewVectorStore] = None
 
 if uploaded_file is not None:
     try:
@@ -1029,6 +1083,53 @@ if uploaded_df is not None:
             f"Predicted **{len(predicted_df):,}** rows using detected column "
             f"`{user_text_col}`."
         )
+
+        # ==================================================================
+        # STEP 4: Build Vector Store for Semantic Search & RAG (Phase 1)
+        # ==================================================================
+        # Detect optional rating column (for metadata filter in Chroma).
+        _rating_col_for_vs: Optional[str] = None
+        for _c in predicted_df.columns:
+            _name = str(_c).strip().lower()
+            if "rating" in _name or "score" in _name or "star" in _name:
+                _rating_col_for_vs = _c
+                break
+
+        with st.spinner("🧠 Building semantic vector index (one-time per upload)..."):
+            try:
+                _progress_bar = st.progress(0.0, text="Embedding reviews...")
+
+                def _on_progress(done: int, total: int) -> None:
+                    pct = float(done) / float(max(total, 1))
+                    _progress_bar.progress(
+                        min(1.0, pct),
+                        text=f"Embedded {done:,} / {total:,} reviews",
+                    )
+
+                vector_store, n_indexed = get_or_build_vector_store(
+                    predicted_df,
+                    text_col=user_text_col,
+                    sentiment_col="Predicted_Sentiment",
+                    rating_col=_rating_col_for_vs,
+                    progress_callback=_on_progress,
+                )
+                _progress_bar.empty()
+
+                if n_indexed > 0:
+                    st.success(
+                        f"🧠 Semantic index ready: **{n_indexed:,}** reviews "
+                        f"embedded with multilingual MiniLM. "
+                        f"Smart Search & Agentic RAG are now active."
+                    )
+                else:
+                    vector_store = None
+                    st.info("No usable text rows to index.")
+            except Exception as _exc:
+                vector_store = None
+                st.warning(
+                    f"⚠️ Vector index build failed: {_exc}. "
+                    "Smart Search disabled, but ML predictions still work."
+                )
 
         # ----- Sentiment distribution chart -----
         dist = (
@@ -1245,6 +1346,94 @@ if uploaded_df is not None:
             file_name="predicted_reviews.csv",
             mime="text/csv",
         )
+
+        # ====================================================================
+        # Phase 1: Smart Semantic Search (vector retrieval, no LLM)
+        # ====================================================================
+        if vector_store is not None and vector_store.indexed_count > 0:
+            st.divider()
+            st.markdown(
+                '<a id="smart-search" class="kiro-anchor"></a>',
+                unsafe_allow_html=True,
+            )
+            st.subheader("🧠 Smart Semantic Search")
+            st.caption(
+                "Search by **meaning**, not keywords. Powered by multilingual "
+                "embeddings (sentence-transformers) + ChromaDB. "
+                "100% local — no LLM calls, free forever."
+            )
+
+            ss_col1, ss_col2, ss_col3 = st.columns([3, 1, 1])
+            with ss_col1:
+                semantic_query = st.text_input(
+                    "🔎 Search reviews by meaning",
+                    value="",
+                    placeholder=(
+                        "e.g. 'shipping was very late', 'sizing problems', "
+                        "'pengiriman lambat' ..."
+                    ),
+                    help="Try paraphrasing — semantic search finds similar meanings.",
+                    key="semantic_query_input",
+                )
+            with ss_col2:
+                ss_top_k = st.slider(
+                    "Top-K", min_value=3, max_value=25, value=10, key="ss_topk"
+                )
+            with ss_col3:
+                ss_sentiment = st.radio(
+                    "Filter",
+                    options=["Any", "Negative", "Positive"],
+                    horizontal=False,
+                    key="ss_sentiment",
+                )
+
+            if semantic_query and semantic_query.strip():
+                with st.spinner("Embedding query and retrieving similar reviews..."):
+                    _filter = None if ss_sentiment == "Any" else ss_sentiment
+                    ss_results = vector_store.search(
+                        query=semantic_query.strip(),
+                        top_k=int(ss_top_k),
+                        sentiment_filter=_filter,
+                    )
+
+                if not ss_results:
+                    st.info(
+                        "No matches found. Try a different query or change the filter."
+                    )
+                else:
+                    st.markdown(
+                        f"**{len(ss_results)} results** for "
+                        f"`{semantic_query}` (filter: `{ss_sentiment}`)"
+                    )
+                    for rank, item in enumerate(ss_results, start=1):
+                        score_pct = float(item.get("score", 0.0)) * 100.0
+                        sentiment = item.get("metadata", {}).get(
+                            "sentiment", "—"
+                        )
+                        rating_val = item.get("metadata", {}).get("rating")
+                        rating_str = (
+                            f"⭐ {rating_val:g}" if rating_val is not None else ""
+                        )
+                        sent_color = (
+                            "#22c55e" if sentiment == "Positive"
+                            else "#ef4444" if sentiment == "Negative"
+                            else "#6B7280"
+                        )
+                        st.markdown(
+                            f"""
+                            <div class="kiro-search-result">
+                              <div class="kiro-search-result-head">
+                                <span class="kiro-search-rank">#{rank}</span>
+                                <span class="kiro-search-score">{score_pct:.1f}% match</span>
+                                <span class="kiro-search-sentiment"
+                                      style="color: {sent_color};">{sentiment}</span>
+                                <span class="kiro-search-rating">{rating_str}</span>
+                              </div>
+                              <div class="kiro-search-result-text">{item.get('text', '')}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
 else:
     st.info(
         "👈 Upload a CSV from the sidebar to predict sentiments. "
@@ -1268,19 +1457,47 @@ model_name = selected_model
 # Gemini AI Consultant — Domain-Aware Aspect-Based Business Intelligence
 # ============================================================================
 st.markdown('<a id="ai-consultant" class="kiro-anchor"></a>', unsafe_allow_html=True)
-st.subheader("🤖 Ask AI Consultant (Domain-Aware Aspect Analysis)")
+st.subheader("🤖 Ask AI Consultant (Agentic RAG)")
 st.markdown(
     "Generate an executive **aspect-based** report from negative reviews. "
-    "The prompt automatically adapts to the detected **domain** (clothing/shoes/electronics) "
-    "and **language** (English/Indonesian). Pain points are categorized by relevant "
-    "business areas with prioritized action items."
+    "When a vector index is available, this runs through a **LangGraph workflow** "
+    "(retrieve → synthesize) for targeted, grounded insights — Gemini is called "
+    "only **once per report**."
 )
+
+# Optional topic for RAG-style targeted retrieval
+rag_query = ""
+if vector_store is not None and vector_store.indexed_count > 0:
+    rag_query = st.text_input(
+        "🎯 Topic / focus area (optional — leave blank for general overview)",
+        value="",
+        placeholder=(
+            "e.g. 'shipping delays', 'sole comfort', 'sizing inconsistency', "
+            "'pengiriman lambat' ..."
+        ),
+        help=(
+            "Guides the LangGraph retrieval node to fetch reviews most relevant "
+            "to your topic, then Gemini synthesizes a focused report."
+        ),
+        key="rag_query_input",
+    )
+    rag_top_k = st.slider(
+        "Reviews to retrieve for synthesis",
+        min_value=5, max_value=25, value=10,
+        key="rag_topk",
+    )
+else:
+    rag_top_k = 10
+    st.caption(
+        "_Upload a CSV to enable LangGraph Agentic RAG. "
+        "Without it, this falls back to base-dataset random sampling._"
+    )
 
 trigger = st.button("🚀 Generate Insights", type="primary")
 
 
 def collect_negative_samples() -> Tuple[list[str], str]:
-    """Get up to 10 negative review texts for Gemini."""
+    """Get up to 10 negative review texts for Gemini (fallback when no vector store)."""
     if predicted_df is not None and user_text_col is not None:
         neg_texts = [
             str(predicted_df.iloc[i][user_text_col])
@@ -1304,7 +1521,68 @@ if trigger:
             "Gemini API key not configured. Add `GEMINI_API_KEY` to "
             "`.streamlit/secrets.toml` then refresh."
         )
+    elif vector_store is not None and vector_store.indexed_count > 0:
+        # ---- LangGraph Agentic RAG path ----
+        # Determine domain/language context for prompt adaptation
+        _gemini_domain = "general"
+        _gemini_language = "English"
+        _gemini_corrections = 0
+        if predicted_df is not None and user_text_col is not None:
+            _gemini_domain, _gemini_language = detect_dataset_domain(
+                predicted_df, user_text_col
+            )
+            if "Rule_Corrected" in predicted_df.columns:
+                _gemini_corrections = int(predicted_df["Rule_Corrected"].sum())
+
+        with st.spinner(
+            "🔗 Running LangGraph workflow (retrieve → synthesize)..."
+        ):
+            try:
+                rag_result = run_agentic_rag(
+                    vector_store=vector_store,
+                    gemini_caller=call_gemini_consultant,
+                    api_key=api_key,
+                    model_name=GEMINI_MODEL,
+                    query=rag_query.strip(),
+                    domain=_gemini_domain,
+                    language=_gemini_language,
+                    rule_corrected_count=_gemini_corrections,
+                    top_k=int(rag_top_k),
+                    sentiment_filter="Negative",
+                )
+            except Exception as exc:
+                st.error(f"LangGraph workflow failed: {exc}")
+                rag_result = None
+
+        if rag_result is not None:
+            retrieved_docs = rag_result.get("retrieved", []) or []
+            report_md = rag_result.get("report", "") or "_Empty report._"
+
+            # Show LangGraph trace
+            with st.expander(
+                f"🔗 LangGraph Trace — {len(retrieved_docs)} reviews retrieved "
+                f"({'topic: ' + rag_query if rag_query.strip() else 'general'})",
+                expanded=False,
+            ):
+                st.markdown(
+                    f"**Workflow**: `START → retrieve → synthesize → END`\n\n"
+                    f"**Context** → Domain: **{_gemini_domain.title()}** · "
+                    f"Language: **{_gemini_language}** · "
+                    f"Rule Corrections: **{_gemini_corrections}**"
+                )
+                st.markdown("---")
+                st.markdown("**Retrieved reviews (sent to Gemini):**")
+                for i, doc in enumerate(retrieved_docs, 1):
+                    score = float(doc.get("score", 0.0)) * 100.0
+                    text = str(doc.get("text", ""))
+                    st.markdown(
+                        f"{i}. _{score:.1f}% match_ — {text}"
+                    )
+
+            st.markdown("### 💼 Business Intelligence Report")
+            st.markdown(report_md)
     else:
+        # ---- Fallback path: random sampling (no vector store) ----
         samples, source = collect_negative_samples()
         if not samples:
             if source == "user_all_positive":
@@ -1315,13 +1593,11 @@ if trigger:
             else:
                 st.info("No negative reviews available to analyze.")
         else:
-            # Determine domain/language context for prompt adaptation
             _gemini_domain = "general"
             _gemini_language = "English"
             _gemini_corrections = 0
 
             if predicted_df is not None and user_text_col is not None:
-                # Use detected domain/language from the upload flow
                 _gemini_domain, _gemini_language = detect_dataset_domain(
                     predicted_df, user_text_col
                 )

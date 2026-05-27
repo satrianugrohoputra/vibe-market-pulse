@@ -5,8 +5,13 @@ google-genai>=1.0.0
 plotly>=5.18.0
 numpy>=1.24.0
 
+# --- Protobuf compatibility (fixes "Descriptors cannot be created directly" error) ---
+# ChromaDB <0.5 + newer protobuf 4.x clash. Pinning protobuf to the 3.20.x line
+# keeps ChromaDB and google-genai both happy.
+protobuf>=3.20.0,<5.0.0
+
 # --- Agentic RAG: vector store, embeddings, workflow ---
-chromadb>=0.4.0
+# Bumped chromadb to >=0.5.0 to fully fix protobuf descriptor issues.
+chromadb>=0.5.0
 sentence-transformers>=2.7.0
-langchain-core>=0.2.0
 langgraph>=0.2.0

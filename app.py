@@ -14,6 +14,7 @@ User-uploaded CSVs use dynamic, case-insensitive text column detection.
 
 from __future__ import annotations
 
+import html
 import io
 import random
 from typing import Optional, Tuple
@@ -1063,11 +1064,37 @@ if uploaded_df is not None:
 
         with st.spinner("Predicting sentiments..."):
             preds = active_pipeline.predict(cleaned_texts)
+
+            # ----- predict_proba: probability of the predicted class -----
+            # LogisticRegression supports predict_proba natively. We store the
+            # confidence (probability of the chosen class) in a 'Confidence'
+            # column. This is purely additive — no existing logic changes.
+            confidences: Optional[list[float]] = None
+            try:
+                proba = active_pipeline.predict_proba(cleaned_texts)
+                # proba shape: (n_samples, n_classes); pick prob of predicted class
+                # active_pipeline.classes_ -> ordered list of classes (e.g. [0, 1])
+                class_to_idx = {
+                    int(c): i for i, c in enumerate(active_pipeline.classes_)
+                }
+                confidences = [
+                    float(proba[i][class_to_idx[int(preds[i])]])
+                    for i in range(len(preds))
+                ]
+            except Exception:
+                # Pipeline doesn't support predict_proba — keep going gracefully
+                confidences = None
+
             predicted_df = uploaded_df.copy()
             predicted_df["Predicted_IND"] = preds
             predicted_df["Predicted_Sentiment"] = [
                 LABEL_MAP.get(int(p), "Unknown") for p in preds
             ]
+            if confidences is not None:
+                predicted_df["Confidence"] = [round(c, 4) for c in confidences]
+                predicted_df["Confidence_Pct"] = [
+                    f"{c * 100:.1f}%" for c in confidences
+                ]
 
         # ==================================================================
         # STEP 3: Rule-Based Correction — override ML where rating disagrees
@@ -1087,6 +1114,15 @@ if uploaded_df is not None:
             f"Predicted **{len(predicted_df):,}** rows using detected column "
             f"`{user_text_col}`."
         )
+
+        # Show average confidence if available
+        if "Confidence" in predicted_df.columns:
+            avg_conf = float(predicted_df["Confidence"].mean()) * 100
+            low_conf_count = int((predicted_df["Confidence"] < 0.60).sum())
+            st.caption(
+                f"📊 **Avg model confidence**: {avg_conf:.1f}%  ·  "
+                f"**Low-confidence predictions** (<60%): {low_conf_count:,} rows"
+            )
 
         # ==================================================================
         # STEP 4: Build Vector Store for Semantic Search & RAG (Phase 1)
@@ -1326,8 +1362,10 @@ if uploaded_df is not None:
             + ")"
         )
 
-        # Reorder columns: text first, then sentiment, then everything else
+        # Reorder columns: text first, then sentiment, then confidence, then everything else
         display_cols = [user_text_col, "Predicted_Sentiment", "Predicted_IND"]
+        if "Confidence_Pct" in filtered_df.columns:
+            display_cols.append("Confidence_Pct")
         other_cols = [c for c in filtered_df.columns if c not in display_cols]
         display_df = filtered_df[display_cols + other_cols].reset_index(drop=True)
 
@@ -1433,7 +1471,7 @@ if uploaded_df is not None:
                                       style="color: {sent_color};">{sentiment}</span>
                                 <span class="kiro-search-rating">{rating_str}</span>
                               </div>
-                              <div class="kiro-search-result-text">{item.get('text', '')}</div>
+                              <div class="kiro-search-result-text">{html.escape(str(item.get('text', '')))}</div>
                             </div>
                             """,
                             unsafe_allow_html=True,
@@ -1465,12 +1503,13 @@ model_name = selected_model
 # Gemini AI Consultant — Phase 3: 6-node Agentic RAG with Self-Critique Loop
 # ============================================================================
 st.markdown('<a id="ai-consultant" class="kiro-anchor"></a>', unsafe_allow_html=True)
-st.subheader("🤖 Ask AI Consultant (Agentic RAG — Phase 3)")
+st.subheader("🤖 Ask AI Consultant (Agentic RAG · Phase 3)")
 st.markdown(
-    "Generate an executive **aspect-based** report. Runs a **6-node LangGraph** "
-    "workflow with automatic self-critique: "
-    "`parse_query → route_domain → retrieve → cluster → synthesize → validate` "
-    "— looping back if the report fails quality checks (max 2 retries)."
+    "Generate an executive **aspect-based** report from negative reviews. "
+    "When a vector index is available, this runs through a **6-node LangGraph "
+    "workflow** with a **self-critique loop** "
+    "(parse → route → retrieve → cluster → synthesize → validate) — "
+    "Gemini is called only **once per successful run** to stay free-tier-friendly."
 )
 
 # ── Inputs ──────────────────────────────────────────────────────────────────
@@ -1478,26 +1517,28 @@ rag_query = ""
 rag_top_k = 10
 
 if vector_store is not None and vector_store.indexed_count > 0:
-    rag_col1, rag_col2 = st.columns([3, 1])
-    with rag_col1:
-        rag_query = st.text_input(
-            "🎯 Topic / focus area (optional — leave blank for general overview)",
-            value="",
-            placeholder=(
-                "e.g. 'shipping delays', 'sole comfort', 'sizing', "
-                "'pengiriman lambat' ..."
-            ),
-            help=(
-                "Passed to Node A (parse_query) then Node C (retrieve_chunks). "
-                "Leave blank for a broad negative-review sweep."
-            ),
-            key="rag_query_input",
-        )
-    with rag_col2:
-        rag_top_k = st.slider(
-            "Top-K per retrieve", min_value=5, max_value=25, value=10,
-            key="rag_topk",
-        )
+    rag_query = st.text_input(
+        "🎯 Topic / focus area (optional — leave blank for general overview)",
+        value="",
+        placeholder=(
+            "e.g. 'shipping delays', 'sole comfort', 'sizing inconsistency', "
+            "'pengiriman lambat' ..."
+        ),
+        help=(
+            "Guides the LangGraph retrieval node to fetch reviews most relevant "
+            "to your topic, then Gemini synthesizes a focused report."
+        ),
+        key="rag_query_input",
+    )
+    rag_top_k = st.slider(
+        "Reviews to retrieve for synthesis",
+        min_value=5, max_value=30, value=15,
+        key="rag_topk",
+        help=(
+            "More reviews give Gemini broader context (better aspect coverage) "
+            "but use slightly more tokens. 15-20 is a sweet spot for free tier."
+        ),
+    )
 else:
     st.caption(
         "_Upload a CSV to enable LangGraph Agentic RAG (Phase 3). "
@@ -1507,8 +1548,15 @@ else:
 trigger = st.button("🚀 Generate Insights", type="primary")
 
 
-def collect_negative_samples() -> Tuple[list[str], str]:
-    """Get up to 10 negative review texts for Gemini (fallback when no vector store)."""
+def collect_negative_samples(max_samples: int = 15) -> Tuple[list[str], str]:
+    """
+    Collect up to `max_samples` negative review texts for Gemini.
+
+    Used as the fallback path when no vector store is available. We sample
+    randomly to give Gemini diverse coverage of complaint topics. 15 reviews
+    gives broader aspect coverage than 10 while staying token-light for free
+    Gemini tier.
+    """
     if predicted_df is not None and user_text_col is not None:
         neg_texts = [
             str(predicted_df.iloc[i][user_text_col])
@@ -1518,12 +1566,18 @@ def collect_negative_samples() -> Tuple[list[str], str]:
         ]
         if len(neg_texts) == 0:
             return [], "user_all_positive"
-        return random.sample(neg_texts, min(10, len(neg_texts))), "your uploaded data"
+        return (
+            random.sample(neg_texts, min(max_samples, len(neg_texts))),
+            "your uploaded data",
+        )
 
     base_neg = [t for t in base.get("base_negative_samples", []) if str(t).strip()]
     if len(base_neg) == 0:
         return [], "no source"
-    return random.sample(base_neg, k=min(10, len(base_neg))), "base dataset test set"
+    return (
+        random.sample(base_neg, k=min(max_samples, len(base_neg))),
+        "base dataset test set",
+    )
 
 
 if trigger:
@@ -1545,44 +1599,10 @@ if trigger:
             if "Rule_Corrected" in predicted_df.columns:
                 _gemini_corrections = int(predicted_df["Rule_Corrected"].sum())
 
-        # Step-by-step progress display
-        STEP_LABELS = {
-            "parse_query":       ("A", "🔍 Parsing query"),
-            "route_domain":      ("B", "🗺️ Routing domain"),
-            "retrieve_chunks":   ("C", "📥 Retrieving chunks"),
-            "cluster_aspects":   ("D", "🔵 Clustering aspects"),
-            "synthesize_report": ("E", "✨ Synthesizing report (Gemini)"),
-            "validate_report":   ("F", "✅ Validating report"),
-            "increment_retry":   ("↩", "🔄 Refining query (retry)"),
-        }
-
-        progress_area = st.empty()
-        status_area   = st.empty()
-
-        def _render_steps(log: list[str], active_label: str = "") -> None:
-            """Renders a step-progress bar into progress_area."""
-            lines = []
-            seen: set = set()
-            for raw in log:
-                # raw may contain "(attempt N)" — strip for lookup
-                key = raw.split(" (")[0]
-                if key in seen:
-                    continue
-                seen.add(key)
-                if key in STEP_LABELS:
-                    letter, label = STEP_LABELS[key]
-                    marker = "🟢" if raw != active_label else "🟡"
-                    lines.append(f"{marker} **{letter}** {label}")
-            if lines:
-                progress_area.markdown("  →  ".join(lines))
-
-        status_area.info("🔗 Starting LangGraph Phase 3 workflow…")
-
-        rag_result = None
-        try:
-            # We run the graph and show live step updates by streaming
-            # state checkpoints via .stream() if available, else invoke().
-            app_graph = None
+        with st.spinner(
+            "🔗 Running LangGraph workflow "
+            "(parse → route → retrieve → cluster → synthesize → validate)..."
+        ):
             try:
                 from src.ai.agent_graph import build_phase3_graph
                 app_graph = build_phase3_graph(
@@ -1660,40 +1680,27 @@ if trigger:
         status_area.empty()
 
         if rag_result is not None:
-            retrieved_docs  = rag_result.get("retrieved")      or []
-            aspect_clusters = rag_result.get("aspect_clusters") or {}
-            report_md       = rag_result.get("report")          or "_Empty report._"
-            val_passed      = rag_result.get("validation_passed", False)
-            val_notes       = rag_result.get("validation_notes", "")
-            step_log        = rag_result.get("step_log")        or []
-            retry_count     = int(rag_result.get("retry_count", 0))
+            retrieved_docs = rag_result.get("retrieved", []) or []
+            report_md = rag_result.get("report", "") or "_Empty report._"
+            clusters = rag_result.get("clusters", []) or []
+            validation = rag_result.get("validation", {}) or {}
+            step_log = rag_result.get("step_log", []) or []
+            loop_count = int(rag_result.get("loop_count", 0))
 
-            # ── Validation badge ─────────────────────────────────────────
-            if val_passed:
-                st.success(f"✅ Report validated. {val_notes}")
-            else:
-                st.warning(
-                    f"⚠️ Report accepted after {retry_count} self-critique "
-                    f"loop(s) (max retries reached). Note: {val_notes}"
-                )
+            # ── Phase 3: Step-by-step LangGraph trace ──
+            workflow_label = (
+                "START → parse_query → route_domain → retrieve → "
+                "cluster_aspects → synthesize → validate → END"
+            )
+            if loop_count > 0:
+                workflow_label += f"  (with {loop_count} self-critique loop{'s' if loop_count > 1 else ''})"
 
-            # ── Workflow trace expander ──────────────────────────────────
             with st.expander(
-                f"🔗 LangGraph Trace — {len(step_log)} steps · "
-                f"{len(retrieved_docs)} reviews retrieved · "
-                f"{'topic: ' + rag_query if rag_query.strip() else 'general overview'}",
+                f"🔗 LangGraph Trace — {len(retrieved_docs)} retrieved · "
+                f"{len(clusters)} aspects · {loop_count} loop(s)",
                 expanded=False,
             ):
-                # Step timeline
-                st.markdown("**Workflow steps executed:**")
-                step_badges = []
-                for raw in step_log:
-                    key = raw.split(" (")[0]
-                    letter, label = STEP_LABELS.get(key, ("·", raw))
-                    step_badges.append(f"`{letter}` {label}")
-                st.markdown("  →  ".join(step_badges))
-
-                st.markdown("---")
+                st.markdown(f"**Workflow:** `{workflow_label}`")
                 st.markdown(
                     f"**Context** → Domain: **{_gemini_domain.title()}** · "
                     f"Language: **{_gemini_language}** · "
@@ -1701,24 +1708,46 @@ if trigger:
                     f"Retries: **{retry_count}**"
                 )
 
-                # Cluster summary (Node D output)
-                if aspect_clusters:
+                # Validation badge
+                if validation:
+                    cov = float(validation.get("coverage_pct", 0.0)) * 100
+                    is_valid = bool(validation.get("is_valid", False))
+                    badge = (
+                        f"✅ **Validation passed** — {cov:.0f}% aspect coverage"
+                        if is_valid
+                        else f"⚠️ **Validation incomplete** — {cov:.0f}% aspect coverage"
+                    )
+                    st.markdown(badge)
+
+                st.markdown("---")
+                st.markdown("**🪜 Step-by-step execution log:**")
+                for i, step in enumerate(step_log, 1):
+                    st.markdown(
+                        f"`{i:02d}.` **{step.get('step', '')}** — "
+                        f"{html.escape(str(step.get('info', '')))}"
+                    )
+
+                # Cluster summary
+                if clusters:
                     st.markdown("---")
-                    st.markdown("**Semantic clusters (Node D — cluster_aspects):**")
-                    for label, items in aspect_clusters.items():
+                    st.markdown("**🎯 Aspect Clusters (KMeans on retrieved reviews):**")
+                    for c in clusters:
+                        kw = ", ".join(c.get("keywords", [])[:5])
                         st.markdown(
-                            f"- `{label}`: {len(items)} review(s)"
+                            f"- **Cluster #{c['cluster_id']}** "
+                            f"({c['size']} reviews) — keywords: `{kw}`"
                         )
 
-                # Retrieved docs
                 st.markdown("---")
                 st.markdown(
                     f"**Retrieved reviews used for synthesis ({len(retrieved_docs)}):**"
                 )
                 for i, doc in enumerate(retrieved_docs, 1):
                     score = float(doc.get("score", 0.0)) * 100.0
-                    text  = str(doc.get("text", ""))
-                    st.markdown(f"{i}. _{score:.1f}% match_ — {text}")
+                    text = html.escape(str(doc.get("text", "")))
+                    st.markdown(
+                        f"{i}. _{score:.1f}% match_ — {text}"
+                    )
 
             # ── Final report ─────────────────────────────────────────────
             st.markdown("### 💼 Business Intelligence Report")

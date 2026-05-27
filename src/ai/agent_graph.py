@@ -1,41 +1,5 @@
 """
-Agent Graph Module — LangGraph Agentic RAG  (Phase 3)
-======================================================
-6-node workflow with self-critique loop:
-
-    START
-      │
-      ▼
-    [A] parse_query        — rule-based, no LLM
-      │
-      ▼
-    [B] route_domain       — uses domain/language already in state
-      │
-      ▼
-    [C] retrieve_chunks    — ChromaDB semantic search
-      │
-      ▼
-    [D] cluster_aspects    — sklearn KMeans grouping, no LLM
-      │
-      ▼
-    [E] synthesize_report  — single Gemini call
-      │
-      ▼
-    [F] validate_report    — rule-based quality check
-      │
-      ├─ PASS ──────────────────────────────────► END
-      │
-      └─ FAIL (retry_count < MAX_RETRIES)
-           │
-           └─ refine_query ──────────────────────► [C] (with broader query)
-
-Design rules:
-- Gemini is called exactly ONCE per successful path (E only).
-- If validation fails and we retry, we re-call Gemini once more (max 2 calls total).
-- All non-LLM nodes are fast and free.
-- `step_log` in state records node names for step-by-step UI rendering.
-- `run_agentic_rag_p3()` is the new public entry point (keeps old `run_agentic_rag`
-  as a thin alias for backward compatibility).
+Agent Graph Module — LangGraph Agentic RAG (Phase 3: Self-Critique Loop)
 """
 
 from __future__ import annotations
@@ -62,146 +26,141 @@ ASPECT_CHECKS = {
 # Minimum number of sections that must be present for validation to pass.
 MIN_SECTIONS_REQUIRED = 3
 
+from .aspect_clusters import (
+    cluster_reviews,
+    balanced_sample_from_clusters,
+    validate_report_coverage,
+    ClusterInfo,
+)
 
-# ---------------------------------------------------------------------------
-# State schema
-# ---------------------------------------------------------------------------
+# Top-level imports — fail-fast if LangGraph isn't installed.
+try:
+    from langgraph.graph import StateGraph, END
+except ImportError as exc:  # pragma: no cover
+    raise ImportError(
+        "LangGraph is required for the Agentic RAG workflow. "
+        "Install it with: pip install langgraph>=0.2.0"
+    ) from exc
+
+
+# ============================================================================
+# Constants — workflow tuning knobs
+# ============================================================================
+MAX_LOOPS = 2                # at most 2 retries before forcing END
+DEFAULT_N_CLUSTERS = 4       # KMeans target on retrieved reviews
+GENERIC_FALLBACK_QUERY = (
+    "negative complaint problem issue bad disappointed kecewa jelek lambat rusak"
+)
+
+
+# ============================================================================
+# Graph state schema
+# ============================================================================
 class GraphState(TypedDict, total=False):
-    # ── Inputs (set before first node) ──────────────────────────────────
-    query: str                        # User-provided topic / focus area
-    domain: str                       # Detected product domain
-    language: str                     # "English" or "Indonesian"
-    rule_corrected_count: int         # For Gemini context note
-    top_k: int                        # Retrieval depth
-    sentiment_filter: Optional[str]   # e.g. "Negative"
+    # ── Inputs ──
+    query: str                              # User-provided topic (may be empty)
+    original_query: str                     # Preserved for trace; never mutated
+    domain: str                             # Detected domain
+    language: str                           # Detected language
+    rule_corrected_count: int               # For Gemini context note
+    top_k: int                              # Retrieval depth
+    sentiment_filter: Optional[str]         # "Negative" by default
 
-    # ── Intermediate ────────────────────────────────────────────────────
-    parsed_query: str                 # Cleaned / expanded query (Node A)
-    effective_domain: str             # Confirmed domain (Node B)
-    retrieved: list                   # [{id, text, metadata, score}, …] (Node C)
-    aspect_clusters: dict             # {label: [texts]} (Node D)
-    retry_count: int                  # How many times we've looped back
-    step_log: list                    # ["parse_query", "route_domain", …]
+    # ── Intermediate ──
+    retrieved: list                         # List[dict] from vector_store.search
+    clusters: list                          # List[ClusterInfo] from KMeans
+    balanced_samples: list                  # Texts after round-robin pick
+    is_query_generic: bool                  # parse_query → True if topic empty
 
-    # ── Outputs ─────────────────────────────────────────────────────────
-    report: str                       # Final markdown report (Node E)
-    validation_passed: bool           # True if Node F accepted the report
-    validation_notes: str             # Why validation passed / failed
-    error: Optional[str]              # Set if a node raises unexpectedly
-
-
-# ---------------------------------------------------------------------------
-# Node A — parse_query
-# ---------------------------------------------------------------------------
-def _make_parse_query_node():
-    """
-    Rule-based query normaliser.
-    - Strips excess whitespace.
-    - If query is empty → substitutes a broad negative-sentiment fallback.
-    - Detects simple Indonesian queries and flags them (no LLM needed).
-    """
-    INDONESIAN_MARKERS = ["kecewa", "jelek", "kurang", "buruk", "lambat",
-                          "rusak", "mengecewakan", "tidak", "ga", "gak"]
-
-    def parse_query(state: GraphState) -> GraphState:
-        raw = (state.get("query") or "").strip()
-
-        if not raw:
-            parsed = DEFAULT_FALLBACK_QUERY
-        else:
-            # Collapse whitespace, lowercase for processing
-            parsed = " ".join(raw.split())
-
-        # If query contains Indonesian words, expand it with English synonyms
-        # so the multilingual embedder gets stronger signal
-        lower = parsed.lower()
-        if any(w in lower for w in INDONESIAN_MARKERS):
-            parsed = parsed + " complaint problem issue bad negative"
-
-        log = list(state.get("step_log") or [])
-        log.append("parse_query")
-
-        return {
-            **state,
-            "parsed_query": parsed,
-            "step_log": log,
-            "retry_count": state.get("retry_count", 0),
-            "error": None,
-        }
-
-    return parse_query
+    # ── Outputs ──
+    report: str                             # Final markdown report
+    validation: dict                        # output of validate_report_coverage
+    step_log: list                          # ordered list of step records (UI)
+    loop_count: int                         # how many self-critique loops ran
+    error: Optional[str]                    # set if a node fails
 
 
-# ---------------------------------------------------------------------------
-# Node B — route_domain
-# ---------------------------------------------------------------------------
-def _make_route_domain_node():
-    """
-    Confirms the effective domain from state.
-    In Phase 3 this is still rule-based (domain was already detected by
-    detect_dataset_domain in app.py before the graph runs).
-    Future versions can call an LLM here for multi-domain routing.
-    """
-    DOMAIN_ASPECT_MAP = {
-        "clothing":    ["sizing", "fabric", "fit", "material", "washing"],
-        "shoes":       ["sole", "comfort", "grip", "durability", "sizing"],
-        "electronics": ["battery", "screen", "charging", "sound", "performance"],
-        "general":     ["quality", "service", "shipping", "pricing", "design"],
+# ============================================================================
+# Helpers
+# ============================================================================
+def _log_step(state: GraphState, name: str, info: str) -> list:
+    """Return a NEW step_log list with a step appended (immutable update)."""
+    log = list(state.get("step_log") or [])
+    log.append({"step": name, "info": info})
+    return log
+
+
+# ============================================================================
+# Node 1 — parse_query (rule-based, no LLM)
+# ============================================================================
+def parse_query_node(state: GraphState) -> GraphState:
+    raw = (state.get("query") or "").strip()
+    is_generic = len(raw) == 0
+
+    # Normalize: collapse whitespace, lowercase doesn't matter (embedder
+    # handles casing) but trimming + length check is enough.
+    normalized = raw if not is_generic else GENERIC_FALLBACK_QUERY
+
+    return {
+        **state,
+        "query": normalized,
+        "original_query": raw,
+        "is_query_generic": is_generic,
+        "step_log": _log_step(
+            state,
+            "1️⃣ Parse Query",
+            f"{'Empty topic — using generic fallback' if is_generic else f'Topic: {raw!r}'}",
+        ),
     }
 
-    def route_domain(state: GraphState) -> GraphState:
-        domain = (state.get("domain") or "general").lower()
-        if domain not in DOMAIN_ASPECT_MAP:
-            domain = "general"
 
-        log = list(state.get("step_log") or [])
-        log.append("route_domain")
+# ============================================================================
+# Node 2 — route_domain (pass-through, already detected in app.py)
+# ============================================================================
+def route_domain_node(state: GraphState) -> GraphState:
+    domain = state.get("domain", "general")
+    language = state.get("language", "English")
+    return {
+        **state,
+        "step_log": _log_step(
+            state,
+            "2️⃣ Route Domain",
+            f"Domain: {domain.title()} · Language: {language}",
+        ),
+    }
 
-        return {
-            **state,
-            "effective_domain": domain,
-            "step_log": log,
-        }
 
-    return route_domain
-
-
-# ---------------------------------------------------------------------------
-# Node C — retrieve_chunks
-# ---------------------------------------------------------------------------
-def _make_retrieve_chunks_node(vector_store):
-    """
-    Semantic retrieval from ChromaDB.
-    On retry (retry_count > 0) the query is broadened automatically.
-    """
-
-    def retrieve_chunks(state: GraphState) -> GraphState:
-        retry = int(state.get("retry_count", 0))
-        query = state.get("parsed_query") or DEFAULT_FALLBACK_QUERY
-
-        # On retry: widen the query to cast a broader net
-        if retry > 0:
-            query = query + " " + DEFAULT_FALLBACK_QUERY
-            top_k = min(int(state.get("top_k", 10)) + 5 * retry, 25)
-        else:
-            top_k = int(state.get("top_k", 10))
-
-        log = list(state.get("step_log") or [])
-        log.append(f"retrieve_chunks (attempt {retry + 1})")
-
+# ============================================================================
+# Node 3 — retrieve (ChromaDB cosine search)
+# ============================================================================
+def _make_retrieve_node(vector_store):
+    def retrieve_node(state: GraphState) -> GraphState:
+        query = (state.get("query") or "").strip() or GENERIC_FALLBACK_QUERY
         try:
             results = vector_store.search(
                 query=query,
                 top_k=top_k,
                 sentiment_filter=state.get("sentiment_filter"),
             )
-            return {**state, "retrieved": results, "step_log": log, "error": None}
+            return {
+                **state,
+                "retrieved": results,
+                "error": None,
+                "step_log": _log_step(
+                    state,
+                    "3️⃣ Retrieve",
+                    f"Top-{len(results)} reviews fetched (cosine similarity)",
+                ),
+            }
         except Exception as exc:
             return {
                 **state,
                 "retrieved": [],
                 "step_log": log,
                 "error": f"Retrieval failed: {exc}",
+                "step_log": _log_step(
+                    state, "3️⃣ Retrieve", f"❌ Failed: {exc}"
+                ),
             }
 
     return retrieve_chunks
@@ -221,96 +180,105 @@ def _make_cluster_aspects_node():
     Output: state["aspect_clusters"] = {cluster_label: [review_texts]}
     """
 
-    def cluster_aspects(state: GraphState) -> GraphState:
-        retrieved = state.get("retrieved") or []
-        log = list(state.get("step_log") or [])
-        log.append("cluster_aspects")
+# ============================================================================
+# Node 4 — cluster_aspects (sklearn KMeans, no LLM)
+# ============================================================================
+def cluster_aspects_node(state: GraphState) -> GraphState:
+    retrieved = state.get("retrieved", []) or []
+    texts = [
+        str(r.get("text", "")).strip()
+        for r in retrieved
+        if isinstance(r, dict) and str(r.get("text", "")).strip()
+    ]
 
-        texts = [
-            r["text"] for r in retrieved
-            if isinstance(r, dict) and str(r.get("text", "")).strip()
-        ]
+    if len(texts) < 6:
+        # Too few reviews to cluster meaningfully; pass through unchanged
+        return {
+            **state,
+            "clusters": [],
+            "balanced_samples": texts,
+            "step_log": _log_step(
+                state,
+                "4️⃣ Cluster Aspects",
+                f"Only {len(texts)} reviews — clustering skipped, "
+                "using all reviews as-is",
+            ),
+        }
 
-        if len(texts) < 4:
-            # Too few texts to cluster meaningfully — one group is fine
-            clusters = {"all_reviews": texts}
-            return {**state, "aspect_clusters": clusters, "step_log": log}
+    clusters = cluster_reviews(texts, n_clusters=DEFAULT_N_CLUSTERS)
 
-        try:
-            import numpy as np
-            from sklearn.cluster import KMeans
-            from sklearn.preprocessing import normalize
+    if not clusters:
+        return {
+            **state,
+            "clusters": [],
+            "balanced_samples": texts,
+            "step_log": _log_step(
+                state,
+                "4️⃣ Cluster Aspects",
+                "Clustering failed — using all retrieved reviews",
+            ),
+        }
 
-            # Reuse the vector store embedder to get embeddings
-            # Import lazily so this node doesn't fail if embedder unavailable
-            from src.ai.vector_store import get_embedding_model
-            embedder = get_embedding_model()
+    # Round-robin pick to give Gemini balanced exposure to every aspect
+    balanced = balanced_sample_from_clusters(
+        clusters,
+        texts,
+        target_size=len(texts),  # use all available; round-robin just orders
+    )
 
-            embeddings = embedder.encode(
-                texts, show_progress_bar=False, convert_to_numpy=True
-            )
-            embeddings = normalize(embeddings)
-
-            # Decide number of clusters: min(4, len//3) capped at 5
-            n_clusters = max(2, min(5, len(texts) // 3))
-            km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            labels = km.fit_predict(embeddings)
-
-            clusters: dict = {}
-            for label, text in zip(labels, texts):
-                key = f"cluster_{int(label) + 1}"
-                clusters.setdefault(key, []).append(text)
-
-        except Exception:
-            # Fallback: single cluster
-            clusters = {"all_reviews": texts}
-
-        return {**state, "aspect_clusters": clusters, "step_log": log}
-
-    return cluster_aspects
+    cluster_summary = " · ".join(
+        f"#{c['cluster_id']}({c['size']}): {', '.join(c['keywords'][:3])}"
+        for c in clusters
+    )
+    return {
+        **state,
+        "clusters": clusters,
+        "balanced_samples": balanced,
+        "step_log": _log_step(
+            state,
+            "4️⃣ Cluster Aspects",
+            f"Found {len(clusters)} aspect groups → {cluster_summary}",
+        ),
+    }
 
 
-# ---------------------------------------------------------------------------
-# Node E — synthesize_report  (the ONE Gemini call)
-# ---------------------------------------------------------------------------
-def _make_synthesize_report_node(
+# ============================================================================
+# Node 5 — synthesize (Gemini, ONLY LLM call)
+# ============================================================================
+def _make_synthesize_node(
     gemini_caller: Callable[..., str],
     api_key: str,
     model_name: str,
 ):
-    """
-    Sends retrieved reviews to Gemini for synthesis.
-    Passes cluster information via an enriched preamble so Gemini is aware
-    of the thematic groupings identified in Node D.
-    """
-
-    def synthesize_report(state: GraphState) -> GraphState:
+    def synthesize_node(state: GraphState) -> GraphState:
         if state.get("error"):
-            log = list(state.get("step_log") or [])
-            log.append("synthesize_report (skipped — error)")
             return {
                 **state,
                 "report": f"_⚠️ {state['error']}_",
-                "step_log": log,
+                "step_log": _log_step(
+                    state, "5️⃣ Synthesize", "Skipped due to upstream error"
+                ),
             }
 
-        retrieved = state.get("retrieved") or []
-        review_texts = [
-            r["text"] for r in retrieved
-            if isinstance(r, dict) and str(r.get("text", "")).strip()
-        ]
+        # Prefer balanced cluster samples; fall back to raw retrieved texts
+        balanced = state.get("balanced_samples") or []
+        if not balanced:
+            balanced = [
+                str(r.get("text", "")).strip()
+                for r in (state.get("retrieved") or [])
+                if isinstance(r, dict) and str(r.get("text", "")).strip()
+            ]
 
-        log = list(state.get("step_log") or [])
-        log.append("synthesize_report")
-
-        if not review_texts:
+        if not balanced:
             return {
                 **state,
                 "report": (
                     "_No relevant reviews retrieved for this query. "
                     "Try a different topic or upload more data._"
                 ),
-                "step_log": log,
+                "step_log": _log_step(
+                    state, "5️⃣ Synthesize", "No reviews to synthesize"
+                ),
             }
 
         # Build cluster preamble for Gemini context
@@ -347,7 +315,7 @@ def _make_synthesize_report_node(
 
             output = gemini_caller(
                 api_key,
-                review_texts,
+                balanced,
                 model_name=model_name,
                 domain=enriched_domain,
                 language=state.get("language", "English"),
@@ -356,31 +324,22 @@ def _make_synthesize_report_node(
                 # otherwise it's silently ignored by the existing caller.
                 extra_context=cluster_preamble + retry_note,
             )
-            return {**state, "report": output, "step_log": log}
-
-        except TypeError:
-            # Older call_gemini_consultant doesn't accept extra_context — fallback
-            try:
-                output = gemini_caller(
-                    api_key,
-                    review_texts,
-                    model_name=model_name,
-                    domain=state.get("effective_domain") or state.get("domain") or "general",
-                    language=state.get("language", "English"),
-                    rule_corrected_count=int(state.get("rule_corrected_count", 0)),
-                )
-                return {**state, "report": output, "step_log": log}
-            except Exception as exc:
-                return {
-                    **state,
-                    "report": f"_⚠️ Gemini synthesis failed: {exc}_",
-                    "step_log": log,
-                }
+            loop = int(state.get("loop_count", 0))
+            label = "5️⃣ Synthesize" if loop == 0 else f"5️⃣ Synthesize (retry #{loop})"
+            return {
+                **state,
+                "report": output,
+                "step_log": _log_step(
+                    state, label, f"Gemini called once with {len(balanced)} reviews"
+                ),
+            }
         except Exception as exc:
             return {
                 **state,
                 "report": f"_⚠️ Gemini synthesis failed: {exc}_",
-                "step_log": log,
+                "step_log": _log_step(
+                    state, "5️⃣ Synthesize", f"❌ Failed: {exc}"
+                ),
             }
 
     return synthesize_report
@@ -475,65 +434,168 @@ def _increment_retry(state: GraphState) -> GraphState:
     return {**state, "retry_count": int(state.get("retry_count", 0)) + 1}
 
 
-# ---------------------------------------------------------------------------
-# Graph builder — Phase 3
-# ---------------------------------------------------------------------------
-def build_phase3_graph(
+# ============================================================================
+# Node 6 — validate_report (rule-based, no LLM)
+# ============================================================================
+def validate_report_node(state: GraphState) -> GraphState:
+    clusters: list[ClusterInfo] = state.get("clusters") or []
+    report = state.get("report") or ""
+
+    # If Gemini failed earlier, don't bother validating
+    if state.get("error") or report.startswith("_⚠️"):
+        return {
+            **state,
+            "validation": {
+                "is_valid": True,  # treat as terminal — no point looping
+                "coverage_pct": 0.0,
+                "covered_clusters": [],
+                "missed_clusters": [],
+            },
+            "step_log": _log_step(
+                state, "6️⃣ Validate", "Skipped (upstream error)"
+            ),
+        }
+
+    result = validate_report_coverage(report, clusters)
+    miss_str = (
+        ", ".join(
+            f"#{c['cluster_id']}({c['keywords'][0]})"
+            for c in result["missed_clusters"]
+        ) or "none"
+    )
+    info = (
+        f"Coverage: {result['coverage_pct'] * 100:.0f}% "
+        f"({len(result['covered_clusters'])}/{len(clusters)} clusters covered) · "
+        f"Missed: {miss_str}"
+    )
+    return {
+        **state,
+        "validation": result,
+        "step_log": _log_step(state, "6️⃣ Validate", info),
+    }
+
+
+# ============================================================================
+# Node 7 — refine_query (rule-based, no LLM)
+# ============================================================================
+def refine_query_node(state: GraphState) -> GraphState:
+    """
+    Build a NEW query that mentions the missed-cluster keywords explicitly,
+    so the next retrieve call pulls reviews that actually mention those topics.
+    """
+    validation = state.get("validation") or {}
+    missed: list[ClusterInfo] = validation.get("missed_clusters") or []
+
+    # Collect top-2 keywords from each missed cluster
+    refine_terms: list[str] = []
+    for cluster in missed:
+        refine_terms.extend(cluster.get("keywords", [])[:2])
+
+    original = state.get("original_query") or ""
+
+    if refine_terms:
+        new_query = " ".join(
+            [original] + refine_terms + ["complaint problem issue"]
+        ).strip()
+    else:
+        # No specific misses — just broaden with the generic fallback
+        new_query = f"{original} {GENERIC_FALLBACK_QUERY}".strip()
+
+    new_loop_count = int(state.get("loop_count", 0)) + 1
+    return {
+        **state,
+        "query": new_query,
+        "loop_count": new_loop_count,
+        "error": None,  # clear so next retrieve is fresh
+        "step_log": _log_step(
+            state,
+            f"🔁 Refine Query (loop {new_loop_count}/{MAX_LOOPS})",
+            f"New query: {new_query!r}",
+        ),
+    }
+
+
+# ============================================================================
+# Conditional edge — decide next step after validation
+# ============================================================================
+def route_after_validation(state: GraphState) -> str:
+    """
+    Conditional router that runs after validate_report_node.
+
+    Returns:
+        "refine"  → loop back to refine_query → retrieve again
+        "end"     → finish the workflow
+    """
+    validation = state.get("validation") or {}
+    is_valid = validation.get("is_valid", True)
+    loop_count = int(state.get("loop_count", 0))
+
+    if not is_valid and loop_count < MAX_LOOPS:
+        return "refine"
+    return "end"
+
+
+# ============================================================================
+# Graph builder
+# ============================================================================
+def build_agentic_rag_graph(
     vector_store,
     gemini_caller: Callable[..., str],
     api_key: str,
     model_name: str,
 ):
     """
-    Compile the full 6-node Phase 3 LangGraph:
+    Compile the 6-node LangGraph with conditional self-critique loop.
 
-        START → parse_query → route_domain → retrieve_chunks
-              → cluster_aspects → synthesize_report → validate_report
-              → END   (or loop back to retrieve_chunks with bumped retry_count)
+    START → parse_query → route_domain → retrieve → cluster_aspects
+                                              ▲           │
+                                              │           ▼
+                                       refine_query   synthesize → validate ──→ END
+                                              ▲                          │
+                                              └──────────(if invalid)────┘
     """
-    from langgraph.graph import StateGraph, END
-
     graph = StateGraph(GraphState)
 
-    # ── Register nodes ──────────────────────────────────────────────────
-    graph.add_node("parse_query",       _make_parse_query_node())
-    graph.add_node("route_domain",      _make_route_domain_node())
-    graph.add_node("retrieve_chunks",   _make_retrieve_chunks_node(vector_store))
-    graph.add_node("cluster_aspects",   _make_cluster_aspects_node())
+    # Register nodes
+    graph.add_node("parse_query", parse_query_node)
+    graph.add_node("route_domain", route_domain_node)
+    graph.add_node("retrieve", _make_retrieve_node(vector_store))
+    graph.add_node("cluster_aspects", cluster_aspects_node)
     graph.add_node(
         "synthesize_report",
         _make_synthesize_report_node(gemini_caller, api_key, model_name),
     )
-    graph.add_node("validate_report",   _make_validate_report_node())
-    # Thin node that bumps the counter before re-entering retrieve on loop
-    graph.add_node("increment_retry",   _increment_retry)
+    graph.add_node("validate", validate_report_node)
+    graph.add_node("refine_query", refine_query_node)
 
-    # ── Wire linear edges ───────────────────────────────────────────────
+    # Linear backbone
     graph.set_entry_point("parse_query")
-    graph.add_edge("parse_query",      "route_domain")
-    graph.add_edge("route_domain",     "retrieve_chunks")
-    graph.add_edge("retrieve_chunks",  "cluster_aspects")
-    graph.add_edge("cluster_aspects",  "synthesize_report")
-    graph.add_edge("synthesize_report","validate_report")
+    graph.add_edge("parse_query", "route_domain")
+    graph.add_edge("route_domain", "retrieve")
+    graph.add_edge("retrieve", "cluster_aspects")
+    graph.add_edge("cluster_aspects", "synthesize")
+    graph.add_edge("synthesize", "validate")
 
-    # ── Conditional edge from validate_report ───────────────────────────
+    # Conditional self-critique loop
     graph.add_conditional_edges(
-        "validate_report",
-        _route_after_validate,
+        "validate",
+        route_after_validation,
         {
-            "__end__":        END,
-            "retrieve_chunks": "increment_retry",
+            "refine": "refine_query",
+            "end": END,
         },
     )
-    graph.add_edge("increment_retry", "retrieve_chunks")
+
+    # After refining, loop back to retrieve (which will re-cluster, re-synthesize)
+    graph.add_edge("refine_query", "retrieve")
 
     return graph.compile()
 
 
-# ---------------------------------------------------------------------------
-# Public runner — Phase 3
-# ---------------------------------------------------------------------------
-def run_agentic_rag_p3(
+# ============================================================================
+# Top-level convenience runner (back-compat with app.py)
+# ============================================================================
+def run_agentic_rag(
     vector_store,
     gemini_caller: Callable[..., str],
     api_key: str,
@@ -549,14 +611,13 @@ def run_agentic_rag_p3(
     Compile and execute the Phase 3 LangGraph workflow.
 
     Returns the final state dict containing:
-        retrieved          list[dict]   – reviews used as context
-        aspect_clusters    dict         – {cluster_label: [texts]}
-        report             str          – Gemini-synthesized markdown
-        validation_passed  bool         – whether validation accepted the report
-        validation_notes   str          – human-readable validation outcome
-        step_log           list[str]    – ordered node names for UI rendering
-        retry_count        int          – number of self-critique loops
-        error              Optional[str]
+        - retrieved: list[dict]
+        - clusters: list[ClusterInfo]
+        - report: str
+        - validation: dict
+        - step_log: list of {step, info}
+        - loop_count: int
+        - error: Optional[str]
     """
     app = build_phase3_graph(
         vector_store=vector_store,
@@ -566,54 +627,24 @@ def run_agentic_rag_p3(
     )
 
     initial_state: GraphState = {
-        "query":                query,
-        "domain":               domain,
-        "language":             language,
+        "query": query,
+        "original_query": "",
+        "domain": domain,
+        "language": language,
         "rule_corrected_count": rule_corrected_count,
-        "top_k":                top_k,
-        "sentiment_filter":     sentiment_filter,
-        # Intermediates
-        "parsed_query":         "",
-        "effective_domain":     domain,
-        "retrieved":            [],
-        "aspect_clusters":      {},
-        "retry_count":          0,
-        "step_log":             [],
-        # Outputs
-        "report":               "",
-        "validation_passed":    False,
-        "validation_notes":     "",
-        "error":                None,
+        "top_k": top_k,
+        "sentiment_filter": sentiment_filter,
+        "retrieved": [],
+        "clusters": [],
+        "balanced_samples": [],
+        "is_query_generic": False,
+        "report": "",
+        "validation": {},
+        "step_log": [],
+        "loop_count": 0,
+        "error": None,
     }
 
-    return app.invoke(initial_state)
-
-
-# ---------------------------------------------------------------------------
-# Backward-compatibility alias (Phase 2 callers still work)
-# ---------------------------------------------------------------------------
-def run_agentic_rag(
-    vector_store,
-    gemini_caller: Callable[..., str],
-    api_key: str,
-    model_name: str,
-    query: str = "",
-    domain: str = "general",
-    language: str = "English",
-    rule_corrected_count: int = 0,
-    top_k: int = 10,
-    sentiment_filter: Optional[str] = "Negative",
-) -> dict:
-    """Thin alias → delegates to run_agentic_rag_p3 (Phase 3 upgrade)."""
-    return run_agentic_rag_p3(
-        vector_store=vector_store,
-        gemini_caller=gemini_caller,
-        api_key=api_key,
-        model_name=model_name,
-        query=query,
-        domain=domain,
-        language=language,
-        rule_corrected_count=rule_corrected_count,
-        top_k=top_k,
-        sentiment_filter=sentiment_filter,
-    )
+    # `recursion_limit` must be high enough to allow MAX_LOOPS retries through
+    # 4 nodes (refine→retrieve→cluster→synthesize→validate).
+    return app.invoke(initial_state, config={"recursion_limit": 50})

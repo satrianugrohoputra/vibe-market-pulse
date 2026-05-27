@@ -33,7 +33,7 @@ from src.ai.vector_store import (
     get_or_build_vector_store,
     ReviewVectorStore,
 )
-from src.ai.agent_graph import run_agentic_rag
+from src.ai.agent_graph import run_agentic_rag, run_agentic_rag_p3
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -431,6 +431,7 @@ def call_gemini_consultant(
     domain: str = "general",
     language: str = "English",
     rule_corrected_count: int = 0,
+    extra_context: str = "",
 ) -> str:
     """
     Send negative reviews to Gemini and request an aspect-based business
@@ -440,6 +441,8 @@ def call_gemini_consultant(
     - domain: adjusts suggested aspect categories (clothing vs shoes vs electronics)
     - language: if Indonesian, instructs Gemini to handle multilingual input
     - rule_corrected_count: informs Gemini about data pre-processing context
+    - extra_context: optional Phase 3 cluster info / retry notes injected by
+                     the LangGraph synthesize_report node
     """
     from google import genai
     client = genai.Client(api_key=api_key)
@@ -509,6 +512,7 @@ def call_gemini_consultant(
         f"**Detected Language**: {language}\n"
         f"{lang_instruction}"
         f"{correction_note}"
+        f"{extra_context}"
         "Categorize the pain points into specific business aspects such as "
         "(but not limited to):\n"
         f"{aspects_block}\n"
@@ -1496,7 +1500,7 @@ GEMINI_MODEL = selected_model
 model_name = selected_model
 
 # ============================================================================
-# Gemini AI Consultant — Domain-Aware Aspect-Based Business Intelligence
+# Gemini AI Consultant — Phase 3: 6-node Agentic RAG with Self-Critique Loop
 # ============================================================================
 st.markdown('<a id="ai-consultant" class="kiro-anchor"></a>', unsafe_allow_html=True)
 st.subheader("🤖 Ask AI Consultant (Agentic RAG · Phase 3)")
@@ -1508,8 +1512,10 @@ st.markdown(
     "Gemini is called only **once per successful run** to stay free-tier-friendly."
 )
 
-# Optional topic for RAG-style targeted retrieval
+# ── Inputs ──────────────────────────────────────────────────────────────────
 rag_query = ""
+rag_top_k = 10
+
 if vector_store is not None and vector_store.indexed_count > 0:
     rag_query = st.text_input(
         "🎯 Topic / focus area (optional — leave blank for general overview)",
@@ -1534,9 +1540,8 @@ if vector_store is not None and vector_store.indexed_count > 0:
         ),
     )
 else:
-    rag_top_k = 10
     st.caption(
-        "_Upload a CSV to enable LangGraph Agentic RAG. "
+        "_Upload a CSV to enable LangGraph Agentic RAG (Phase 3). "
         "Without it, this falls back to base-dataset random sampling._"
     )
 
@@ -1581,9 +1586,9 @@ if trigger:
             "Gemini API key not configured. Add `GEMINI_API_KEY` to "
             "`.streamlit/secrets.toml` then refresh."
         )
+
     elif vector_store is not None and vector_store.indexed_count > 0:
-        # ---- LangGraph Agentic RAG path ----
-        # Determine domain/language context for prompt adaptation
+        # ── Phase 3: LangGraph 6-node path ──────────────────────────────
         _gemini_domain = "general"
         _gemini_language = "English"
         _gemini_corrections = 0
@@ -1599,7 +1604,61 @@ if trigger:
             "(parse → route → retrieve → cluster → synthesize → validate)..."
         ):
             try:
-                rag_result = run_agentic_rag(
+                from src.ai.agent_graph import build_phase3_graph
+                app_graph = build_phase3_graph(
+                    vector_store=vector_store,
+                    gemini_caller=call_gemini_consultant,
+                    api_key=api_key,
+                    model_name=GEMINI_MODEL,
+                )
+            except Exception:
+                app_graph = None
+
+            if app_graph is not None:
+                from src.ai.agent_graph import GraphState as _GS
+                initial: _GS = {
+                    "query":                rag_query.strip(),
+                    "domain":               _gemini_domain,
+                    "language":             _gemini_language,
+                    "rule_corrected_count": _gemini_corrections,
+                    "top_k":                int(rag_top_k),
+                    "sentiment_filter":     "Negative",
+                    "parsed_query":         "",
+                    "effective_domain":     _gemini_domain,
+                    "retrieved":            [],
+                    "aspect_clusters":      {},
+                    "retry_count":          0,
+                    "step_log":             [],
+                    "report":               "",
+                    "validation_passed":    False,
+                    "validation_notes":     "",
+                    "error":                None,
+                }
+
+                # Try streaming node-by-node for live feedback
+                try:
+                    live_state: dict = dict(initial)
+                    for chunk in app_graph.stream(initial):
+                        # chunk is {node_name: state_dict}
+                        for node_name, node_state in chunk.items():
+                            live_state.update(node_state)
+                            log = live_state.get("step_log") or []
+                            step_label = log[-1] if log else node_name
+                            letter, label = STEP_LABELS.get(
+                                node_name, ("·", node_name)
+                            )
+                            status_area.info(
+                                f"⚙️ Step **{letter}** — {label}…"
+                            )
+                            _render_steps(log, step_label)
+                    rag_result = live_state
+                except Exception:
+                    # stream() not available in this version — fall back to invoke
+                    rag_result = app_graph.invoke(initial)
+
+            else:
+                # build failed — use convenience wrapper
+                rag_result = run_agentic_rag_p3(
                     vector_store=vector_store,
                     gemini_caller=call_gemini_consultant,
                     api_key=api_key,
@@ -1611,9 +1670,14 @@ if trigger:
                     top_k=int(rag_top_k),
                     sentiment_filter="Negative",
                 )
-            except Exception as exc:
-                st.error(f"LangGraph workflow failed: {exc}")
-                rag_result = None
+
+        except Exception as exc:
+            st.error(f"LangGraph workflow failed: {exc}")
+            rag_result = None
+
+        # ── Clear live indicators ────────────────────────────────────────
+        progress_area.empty()
+        status_area.empty()
 
         if rag_result is not None:
             retrieved_docs = rag_result.get("retrieved", []) or []
@@ -1640,7 +1704,8 @@ if trigger:
                 st.markdown(
                     f"**Context** → Domain: **{_gemini_domain.title()}** · "
                     f"Language: **{_gemini_language}** · "
-                    f"Rule Corrections: **{_gemini_corrections}**"
+                    f"Rule Corrections: **{_gemini_corrections}** · "
+                    f"Retries: **{retry_count}**"
                 )
 
                 # Validation badge
@@ -1674,7 +1739,9 @@ if trigger:
                         )
 
                 st.markdown("---")
-                st.markdown("**Retrieved reviews (sent to Gemini):**")
+                st.markdown(
+                    f"**Retrieved reviews used for synthesis ({len(retrieved_docs)}):**"
+                )
                 for i, doc in enumerate(retrieved_docs, 1):
                     score = float(doc.get("score", 0.0)) * 100.0
                     text = html.escape(str(doc.get("text", "")))
@@ -1682,10 +1749,12 @@ if trigger:
                         f"{i}. _{score:.1f}% match_ — {text}"
                     )
 
+            # ── Final report ─────────────────────────────────────────────
             st.markdown("### 💼 Business Intelligence Report")
             st.markdown(report_md)
+
     else:
-        # ---- Fallback path: random sampling (no vector store) ----
+        # ── Fallback: random sampling (no vector store) ──────────────────
         samples, source = collect_negative_samples()
         if not samples:
             if source == "user_all_positive":
@@ -1717,7 +1786,7 @@ if trigger:
                     f"Language: **{_gemini_language}** · "
                     f"Rule Corrections: **{_gemini_corrections}**"
                 )
-            with st.spinner(f"Consulting {GEMINI_MODEL}..."):
+            with st.spinner(f"Consulting {GEMINI_MODEL}…"):
                 try:
                     output = call_gemini_consultant(
                         api_key,

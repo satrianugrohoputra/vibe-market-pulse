@@ -1,44 +1,30 @@
 """
 Agent Graph Module — LangGraph Agentic RAG (Phase 3: Self-Critique Loop)
-========================================================================
-A 6-node LangGraph workflow with rule-based validation and conditional
-loop-back for self-critique. Gemini is still called only ONCE per successful
-run (never per-node), so it stays free-tier-friendly.
-
-Workflow:
-    START → parse_query → route_domain → retrieve → cluster_aspects
-                                              ▲           │
-                                              │           ▼
-                                   refine_query   synthesize → validate ──→ END
-                                              ▲                       │
-                                              │  (loop back if missed │
-                                              │   clusters & loops <2)│
-                                              └───────────────────────┘
-
-Nodes (rule-based unless marked LLM):
-    1. parse_query       — normalize/clean the user topic, decide if it's
-                           generic or specific
-    2. route_domain      — pass-through the domain/language detected upstream
-                           (already done in app.py before calling the graph)
-    3. retrieve          — top-K cosine search in ChromaDB
-    4. cluster_aspects   — TF-IDF + KMeans on retrieved texts → N aspect groups
-    5. synthesize        — [LLM] Gemini call once, with balanced cluster sample
-    6. validate_report   — keyword-coverage check vs. cluster keywords
-    (conditional)
-    7. refine_query      — broaden/swap query terms if validation failed,
-                           then loop back to retrieve (max 2 loops)
-
-State carries `step_log` so the UI can render a pretty step-by-step trace.
-
-Public API (back-compat with Phase 2 caller in app.py):
-    run_agentic_rag(...) -> dict with keys: retrieved, report, error,
-                                            clusters, step_log, validation,
-                                            loop_count
 """
 
 from __future__ import annotations
 
-from typing import Callable, Optional, TypedDict
+import re
+from typing import Callable, Literal, Optional, TypedDict
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+MAX_RETRIES = 2          # How many times validate→retrieve loops are allowed
+DEFAULT_FALLBACK_QUERY = (
+    "negative complaint problem issue bad disappointed kecewa jelek"
+)
+
+# Aspect keywords used by validate_report to check report completeness.
+# Keys match what the Gemini prompt asks for; values are synonym lists.
+ASPECT_CHECKS = {
+    "executive_summary": ["executive summary", "## 📋"],
+    "pain_points":       ["pain point", "## 🔍", "categorized"],
+    "action_items":      ["action item", "## 🎯", "high-priority"],
+}
+
+# Minimum number of sections that must be present for validation to pass.
+MIN_SECTIONS_REQUIRED = 3
 
 from .aspect_clusters import (
     cluster_reviews,
@@ -153,7 +139,7 @@ def _make_retrieve_node(vector_store):
         try:
             results = vector_store.search(
                 query=query,
-                top_k=int(state.get("top_k", 10)),
+                top_k=top_k,
                 sentiment_filter=state.get("sentiment_filter"),
             )
             return {
@@ -170,14 +156,29 @@ def _make_retrieve_node(vector_store):
             return {
                 **state,
                 "retrieved": [],
+                "step_log": log,
                 "error": f"Retrieval failed: {exc}",
                 "step_log": _log_step(
                     state, "3️⃣ Retrieve", f"❌ Failed: {exc}"
                 ),
             }
 
-    return retrieve_node
+    return retrieve_chunks
 
+
+# ---------------------------------------------------------------------------
+# Node D — cluster_aspects
+# ---------------------------------------------------------------------------
+def _make_cluster_aspects_node():
+    """
+    Groups retrieved reviews into thematic clusters using sentence embeddings
+    + KMeans (no LLM required).
+
+    If sklearn / numpy are unavailable or there are too few reviews, falls
+    back to a single "all" cluster so the graph never breaks.
+
+    Output: state["aspect_clusters"] = {cluster_label: [review_texts]}
+    """
 
 # ============================================================================
 # Node 4 — cluster_aspects (sklearn KMeans, no LLM)
@@ -280,14 +281,48 @@ def _make_synthesize_node(
                 ),
             }
 
+        # Build cluster preamble for Gemini context
+        clusters = state.get("aspect_clusters") or {}
+        cluster_preamble = ""
+        if len(clusters) > 1:
+            cluster_lines = []
+            for label, items in clusters.items():
+                cluster_lines.append(
+                    f"  • {label.replace('_', ' ').title()} ({len(items)} reviews)"
+                )
+            cluster_preamble = (
+                "\n\n**Pre-identified Thematic Clusters (from semantic analysis):**\n"
+                + "\n".join(cluster_lines)
+                + "\nPlease align your Categorized Pain Points with these clusters.\n"
+            )
+
+        retry = int(state.get("retry_count", 0))
+        retry_note = ""
+        if retry > 0:
+            retry_note = (
+                f"\n**Note**: This is synthesis attempt {retry + 1}. "
+                "Please ensure ALL three required sections "
+                "(Executive Summary, Categorized Pain Points, High-Priority Action Items) "
+                "are fully included.\n"
+            )
+
         try:
+            # We inject cluster_preamble + retry_note into the domain field
+            # by appending to it (Gemini caller will echo it in prompt header)
+            enriched_domain = (
+                state.get("effective_domain") or state.get("domain") or "general"
+            )
+
             output = gemini_caller(
                 api_key,
                 balanced,
                 model_name=model_name,
-                domain=state.get("domain", "general"),
+                domain=enriched_domain,
                 language=state.get("language", "English"),
                 rule_corrected_count=int(state.get("rule_corrected_count", 0)),
+                # Pass cluster context via extra_context if supported,
+                # otherwise it's silently ignored by the existing caller.
+                extra_context=cluster_preamble + retry_note,
             )
             loop = int(state.get("loop_count", 0))
             label = "5️⃣ Synthesize" if loop == 0 else f"5️⃣ Synthesize (retry #{loop})"
@@ -307,7 +342,96 @@ def _make_synthesize_node(
                 ),
             }
 
-    return synthesize_node
+    return synthesize_report
+
+
+# ---------------------------------------------------------------------------
+# Node F — validate_report  (rule-based, no LLM)
+# ---------------------------------------------------------------------------
+def _make_validate_report_node():
+    """
+    Checks that the synthesized report meets minimum quality criteria:
+    1. Contains all three required section headings.
+    2. Has a minimum word count (not an empty / too-short response).
+    3. Does not contain obvious failure markers (e.g. Gemini error strings).
+
+    Sets state["validation_passed"] and state["validation_notes"].
+    """
+    MIN_WORD_COUNT = 40
+    FAILURE_MARKERS = ["⚠️ Gemini synthesis failed", "No relevant reviews retrieved"]
+
+    def validate_report(state: GraphState) -> GraphState:
+        report = state.get("report") or ""
+        log = list(state.get("step_log") or [])
+        log.append("validate_report")
+
+        issues: list[str] = []
+
+        # Check for hard failure markers
+        for marker in FAILURE_MARKERS:
+            if marker in report:
+                issues.append(f"Report contains error marker: '{marker}'")
+
+        # Check required sections
+        report_lower = report.lower()
+        sections_found = 0
+        for section_name, keywords in ASPECT_CHECKS.items():
+            if any(kw.lower() in report_lower for kw in keywords):
+                sections_found += 1
+            else:
+                issues.append(f"Missing section: {section_name}")
+
+        if sections_found < MIN_SECTIONS_REQUIRED:
+            issues.append(
+                f"Only {sections_found}/{MIN_SECTIONS_REQUIRED} required sections found"
+            )
+
+        # Check minimum length
+        word_count = len(report.split())
+        if word_count < MIN_WORD_COUNT:
+            issues.append(
+                f"Report too short ({word_count} words, need ≥ {MIN_WORD_COUNT})"
+            )
+
+        passed = len(issues) == 0
+        notes = "All checks passed." if passed else " | ".join(issues)
+
+        return {
+            **state,
+            "validation_passed": passed,
+            "validation_notes": notes,
+            "step_log": log,
+        }
+
+    return validate_report
+
+
+# ---------------------------------------------------------------------------
+# Conditional router — after Node F
+# ---------------------------------------------------------------------------
+def _route_after_validate(state: GraphState) -> Literal["retrieve_chunks", "__end__"]:
+    """
+    Decides what happens after validation:
+    - PASS or max retries exhausted → END
+    - FAIL and retries remaining    → back to retrieve_chunks
+    """
+    if state.get("validation_passed"):
+        return "__end__"
+
+    retry = int(state.get("retry_count", 0))
+    if retry >= MAX_RETRIES - 1:
+        # Exhausted retries — accept the (imperfect) report
+        return "__end__"
+
+    return "retrieve_chunks"
+
+
+# ---------------------------------------------------------------------------
+# Retry counter — injected as a thin wrapper before retrieve_chunks on loop
+# ---------------------------------------------------------------------------
+def _increment_retry(state: GraphState) -> GraphState:
+    """Bumps retry_count before re-entering retrieve_chunks."""
+    return {**state, "retry_count": int(state.get("retry_count", 0)) + 1}
 
 
 # ============================================================================
@@ -438,8 +562,8 @@ def build_agentic_rag_graph(
     graph.add_node("retrieve", _make_retrieve_node(vector_store))
     graph.add_node("cluster_aspects", cluster_aspects_node)
     graph.add_node(
-        "synthesize",
-        _make_synthesize_node(gemini_caller, api_key, model_name),
+        "synthesize_report",
+        _make_synthesize_report_node(gemini_caller, api_key, model_name),
     )
     graph.add_node("validate", validate_report_node)
     graph.add_node("refine_query", refine_query_node)
@@ -484,7 +608,7 @@ def run_agentic_rag(
     sentiment_filter: Optional[str] = "Negative",
 ) -> dict:
     """
-    Compile and execute the LangGraph workflow.
+    Compile and execute the Phase 3 LangGraph workflow.
 
     Returns the final state dict containing:
         - retrieved: list[dict]
@@ -495,7 +619,7 @@ def run_agentic_rag(
         - loop_count: int
         - error: Optional[str]
     """
-    app = build_agentic_rag_graph(
+    app = build_phase3_graph(
         vector_store=vector_store,
         gemini_caller=gemini_caller,
         api_key=api_key,

@@ -14,6 +14,7 @@ User-uploaded CSVs use dynamic, case-insensitive text column detection.
 
 from __future__ import annotations
 
+import html
 import io
 import random
 from typing import Optional, Tuple
@@ -1059,11 +1060,37 @@ if uploaded_df is not None:
 
         with st.spinner("Predicting sentiments..."):
             preds = active_pipeline.predict(cleaned_texts)
+
+            # ----- predict_proba: probability of the predicted class -----
+            # LogisticRegression supports predict_proba natively. We store the
+            # confidence (probability of the chosen class) in a 'Confidence'
+            # column. This is purely additive — no existing logic changes.
+            confidences: Optional[list[float]] = None
+            try:
+                proba = active_pipeline.predict_proba(cleaned_texts)
+                # proba shape: (n_samples, n_classes); pick prob of predicted class
+                # active_pipeline.classes_ -> ordered list of classes (e.g. [0, 1])
+                class_to_idx = {
+                    int(c): i for i, c in enumerate(active_pipeline.classes_)
+                }
+                confidences = [
+                    float(proba[i][class_to_idx[int(preds[i])]])
+                    for i in range(len(preds))
+                ]
+            except Exception:
+                # Pipeline doesn't support predict_proba — keep going gracefully
+                confidences = None
+
             predicted_df = uploaded_df.copy()
             predicted_df["Predicted_IND"] = preds
             predicted_df["Predicted_Sentiment"] = [
                 LABEL_MAP.get(int(p), "Unknown") for p in preds
             ]
+            if confidences is not None:
+                predicted_df["Confidence"] = [round(c, 4) for c in confidences]
+                predicted_df["Confidence_Pct"] = [
+                    f"{c * 100:.1f}%" for c in confidences
+                ]
 
         # ==================================================================
         # STEP 3: Rule-Based Correction — override ML where rating disagrees
@@ -1083,6 +1110,15 @@ if uploaded_df is not None:
             f"Predicted **{len(predicted_df):,}** rows using detected column "
             f"`{user_text_col}`."
         )
+
+        # Show average confidence if available
+        if "Confidence" in predicted_df.columns:
+            avg_conf = float(predicted_df["Confidence"].mean()) * 100
+            low_conf_count = int((predicted_df["Confidence"] < 0.60).sum())
+            st.caption(
+                f"📊 **Avg model confidence**: {avg_conf:.1f}%  ·  "
+                f"**Low-confidence predictions** (<60%): {low_conf_count:,} rows"
+            )
 
         # ==================================================================
         # STEP 4: Build Vector Store for Semantic Search & RAG (Phase 1)
@@ -1322,8 +1358,10 @@ if uploaded_df is not None:
             + ")"
         )
 
-        # Reorder columns: text first, then sentiment, then everything else
+        # Reorder columns: text first, then sentiment, then confidence, then everything else
         display_cols = [user_text_col, "Predicted_Sentiment", "Predicted_IND"]
+        if "Confidence_Pct" in filtered_df.columns:
+            display_cols.append("Confidence_Pct")
         other_cols = [c for c in filtered_df.columns if c not in display_cols]
         display_df = filtered_df[display_cols + other_cols].reset_index(drop=True)
 
@@ -1429,7 +1467,7 @@ if uploaded_df is not None:
                                       style="color: {sent_color};">{sentiment}</span>
                                 <span class="kiro-search-rating">{rating_str}</span>
                               </div>
-                              <div class="kiro-search-result-text">{item.get('text', '')}</div>
+                              <div class="kiro-search-result-text">{html.escape(str(item.get('text', '')))}</div>
                             </div>
                             """,
                             unsafe_allow_html=True,
@@ -1461,12 +1499,13 @@ model_name = selected_model
 # Gemini AI Consultant — Domain-Aware Aspect-Based Business Intelligence
 # ============================================================================
 st.markdown('<a id="ai-consultant" class="kiro-anchor"></a>', unsafe_allow_html=True)
-st.subheader("🤖 Ask AI Consultant (Agentic RAG)")
+st.subheader("🤖 Ask AI Consultant (Agentic RAG · Phase 3)")
 st.markdown(
     "Generate an executive **aspect-based** report from negative reviews. "
-    "When a vector index is available, this runs through a **LangGraph workflow** "
-    "(retrieve → synthesize) for targeted, grounded insights — Gemini is called "
-    "only **once per report**."
+    "When a vector index is available, this runs through a **6-node LangGraph "
+    "workflow** with a **self-critique loop** "
+    "(parse → route → retrieve → cluster → synthesize → validate) — "
+    "Gemini is called only **once per successful run** to stay free-tier-friendly."
 )
 
 # Optional topic for RAG-style targeted retrieval
@@ -1487,8 +1526,12 @@ if vector_store is not None and vector_store.indexed_count > 0:
     )
     rag_top_k = st.slider(
         "Reviews to retrieve for synthesis",
-        min_value=5, max_value=25, value=10,
+        min_value=5, max_value=30, value=15,
         key="rag_topk",
+        help=(
+            "More reviews give Gemini broader context (better aspect coverage) "
+            "but use slightly more tokens. 15-20 is a sweet spot for free tier."
+        ),
     )
 else:
     rag_top_k = 10
@@ -1500,8 +1543,15 @@ else:
 trigger = st.button("🚀 Generate Insights", type="primary")
 
 
-def collect_negative_samples() -> Tuple[list[str], str]:
-    """Get up to 10 negative review texts for Gemini (fallback when no vector store)."""
+def collect_negative_samples(max_samples: int = 15) -> Tuple[list[str], str]:
+    """
+    Collect up to `max_samples` negative review texts for Gemini.
+
+    Used as the fallback path when no vector store is available. We sample
+    randomly to give Gemini diverse coverage of complaint topics. 15 reviews
+    gives broader aspect coverage than 10 while staying token-light for free
+    Gemini tier.
+    """
     if predicted_df is not None and user_text_col is not None:
         neg_texts = [
             str(predicted_df.iloc[i][user_text_col])
@@ -1511,12 +1561,18 @@ def collect_negative_samples() -> Tuple[list[str], str]:
         ]
         if len(neg_texts) == 0:
             return [], "user_all_positive"
-        return random.sample(neg_texts, min(10, len(neg_texts))), "your uploaded data"
+        return (
+            random.sample(neg_texts, min(max_samples, len(neg_texts))),
+            "your uploaded data",
+        )
 
     base_neg = [t for t in base.get("base_negative_samples", []) if str(t).strip()]
     if len(base_neg) == 0:
         return [], "no source"
-    return random.sample(base_neg, k=min(10, len(base_neg))), "base dataset test set"
+    return (
+        random.sample(base_neg, k=min(max_samples, len(base_neg))),
+        "base dataset test set",
+    )
 
 
 if trigger:
@@ -1539,7 +1595,8 @@ if trigger:
                 _gemini_corrections = int(predicted_df["Rule_Corrected"].sum())
 
         with st.spinner(
-            "🔗 Running LangGraph workflow (retrieve → synthesize)..."
+            "🔗 Running LangGraph workflow "
+            "(parse → route → retrieve → cluster → synthesize → validate)..."
         ):
             try:
                 rag_result = run_agentic_rag(
@@ -1561,24 +1618,66 @@ if trigger:
         if rag_result is not None:
             retrieved_docs = rag_result.get("retrieved", []) or []
             report_md = rag_result.get("report", "") or "_Empty report._"
+            clusters = rag_result.get("clusters", []) or []
+            validation = rag_result.get("validation", {}) or {}
+            step_log = rag_result.get("step_log", []) or []
+            loop_count = int(rag_result.get("loop_count", 0))
 
-            # Show LangGraph trace
+            # ── Phase 3: Step-by-step LangGraph trace ──
+            workflow_label = (
+                "START → parse_query → route_domain → retrieve → "
+                "cluster_aspects → synthesize → validate → END"
+            )
+            if loop_count > 0:
+                workflow_label += f"  (with {loop_count} self-critique loop{'s' if loop_count > 1 else ''})"
+
             with st.expander(
-                f"🔗 LangGraph Trace — {len(retrieved_docs)} reviews retrieved "
-                f"({'topic: ' + rag_query if rag_query.strip() else 'general'})",
+                f"🔗 LangGraph Trace — {len(retrieved_docs)} retrieved · "
+                f"{len(clusters)} aspects · {loop_count} loop(s)",
                 expanded=False,
             ):
+                st.markdown(f"**Workflow:** `{workflow_label}`")
                 st.markdown(
-                    f"**Workflow**: `START → retrieve → synthesize → END`\n\n"
                     f"**Context** → Domain: **{_gemini_domain.title()}** · "
                     f"Language: **{_gemini_language}** · "
                     f"Rule Corrections: **{_gemini_corrections}**"
                 )
+
+                # Validation badge
+                if validation:
+                    cov = float(validation.get("coverage_pct", 0.0)) * 100
+                    is_valid = bool(validation.get("is_valid", False))
+                    badge = (
+                        f"✅ **Validation passed** — {cov:.0f}% aspect coverage"
+                        if is_valid
+                        else f"⚠️ **Validation incomplete** — {cov:.0f}% aspect coverage"
+                    )
+                    st.markdown(badge)
+
+                st.markdown("---")
+                st.markdown("**🪜 Step-by-step execution log:**")
+                for i, step in enumerate(step_log, 1):
+                    st.markdown(
+                        f"`{i:02d}.` **{step.get('step', '')}** — "
+                        f"{html.escape(str(step.get('info', '')))}"
+                    )
+
+                # Cluster summary
+                if clusters:
+                    st.markdown("---")
+                    st.markdown("**🎯 Aspect Clusters (KMeans on retrieved reviews):**")
+                    for c in clusters:
+                        kw = ", ".join(c.get("keywords", [])[:5])
+                        st.markdown(
+                            f"- **Cluster #{c['cluster_id']}** "
+                            f"({c['size']} reviews) — keywords: `{kw}`"
+                        )
+
                 st.markdown("---")
                 st.markdown("**Retrieved reviews (sent to Gemini):**")
                 for i, doc in enumerate(retrieved_docs, 1):
                     score = float(doc.get("score", 0.0)) * 100.0
-                    text = str(doc.get("text", ""))
+                    text = html.escape(str(doc.get("text", "")))
                     st.markdown(
                         f"{i}. _{score:.1f}% match_ — {text}"
                     )

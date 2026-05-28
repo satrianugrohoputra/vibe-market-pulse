@@ -33,7 +33,7 @@ from src.ai.vector_store import (
     get_or_build_vector_store,
     ReviewVectorStore,
 )
-from src.ai.agent_graph import run_agentic_rag
+from src.ai.agent_graph import run_agentic_rag, run_agentic_rag_p3
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -1604,7 +1604,61 @@ if trigger:
             "(parse → route → retrieve → cluster → synthesize → validate)..."
         ):
             try:
-                rag_result = run_agentic_rag(
+                from src.ai.agent_graph import build_phase3_graph
+                app_graph = build_phase3_graph(
+                    vector_store=vector_store,
+                    gemini_caller=call_gemini_consultant,
+                    api_key=api_key,
+                    model_name=GEMINI_MODEL,
+                )
+            except Exception:
+                app_graph = None
+
+            if app_graph is not None:
+                from src.ai.agent_graph import GraphState as _GS
+                initial: _GS = {
+                    "query":                rag_query.strip(),
+                    "domain":               _gemini_domain,
+                    "language":             _gemini_language,
+                    "rule_corrected_count": _gemini_corrections,
+                    "top_k":                int(rag_top_k),
+                    "sentiment_filter":     "Negative",
+                    "parsed_query":         "",
+                    "effective_domain":     _gemini_domain,
+                    "retrieved":            [],
+                    "aspect_clusters":      {},
+                    "retry_count":          0,
+                    "step_log":             [],
+                    "report":               "",
+                    "validation_passed":    False,
+                    "validation_notes":     "",
+                    "error":                None,
+                }
+
+                # Try streaming node-by-node for live feedback
+                try:
+                    live_state: dict = dict(initial)
+                    for chunk in app_graph.stream(initial):
+                        # chunk is {node_name: state_dict}
+                        for node_name, node_state in chunk.items():
+                            live_state.update(node_state)
+                            log = live_state.get("step_log") or []
+                            step_label = log[-1] if log else node_name
+                            letter, label = STEP_LABELS.get(
+                                node_name, ("·", node_name)
+                            )
+                            status_area.info(
+                                f"⚙️ Step **{letter}** — {label}…"
+                            )
+                            _render_steps(log, step_label)
+                    rag_result = live_state
+                except Exception:
+                    # stream() not available in this version — fall back to invoke
+                    rag_result = app_graph.invoke(initial)
+
+            else:
+                # build failed — use convenience wrapper
+                rag_result = run_agentic_rag_p3(
                     vector_store=vector_store,
                     gemini_caller=call_gemini_consultant,
                     api_key=api_key,
@@ -1647,7 +1701,8 @@ if trigger:
                 st.markdown(
                     f"**Context** → Domain: **{_gemini_domain.title()}** · "
                     f"Language: **{_gemini_language}** · "
-                    f"Rule Corrections: **{_gemini_corrections}**"
+                    f"Rule Corrections: **{_gemini_corrections}** · "
+                    f"Retries: **{retry_count}**"
                 )
 
                 # Validation badge

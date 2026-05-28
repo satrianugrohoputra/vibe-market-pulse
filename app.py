@@ -1671,10 +1671,6 @@ if trigger:
                     sentiment_filter="Negative",
                 )
 
-        except Exception as exc:
-            st.error(f"LangGraph workflow failed: {exc}")
-            rag_result = None
-
         # ── Clear live indicators ────────────────────────────────────────
         progress_area.empty()
         status_area.empty()

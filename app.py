@@ -1670,10 +1670,11 @@ if trigger:
                     top_k=int(rag_top_k),
                     sentiment_filter="Negative",
                 )
-
-        # ── Clear live indicators ────────────────────────────────────────
-        progress_area.empty()
-        status_area.empty()
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()  # full trace ke Streamlit Cloud logs
+                st.error(f"❌ LangGraph workflow failed: {exc}")
+                rag_result = None
 
         if rag_result is not None:
             retrieved_docs = rag_result.get("retrieved", []) or []

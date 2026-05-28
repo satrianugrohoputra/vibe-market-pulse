@@ -33,7 +33,7 @@ from src.ai.vector_store import (
     get_or_build_vector_store,
     ReviewVectorStore,
 )
-from src.ai.agent_graph import run_agentic_rag, run_agentic_rag_p3
+from src.ai.agent_graph import run_agentic_rag
 
 # ----------------------------------------------------------------------------
 # Constants
@@ -1588,7 +1588,7 @@ if trigger:
         )
 
     elif vector_store is not None and vector_store.indexed_count > 0:
-        # ── Phase 3: LangGraph 6-node path ──────────────────────────────
+        # ── LangGraph Agentic RAG path ──────────────────────────────────
         _gemini_domain = "general"
         _gemini_language = "English"
         _gemini_corrections = 0
@@ -1599,66 +1599,13 @@ if trigger:
             if "Rule_Corrected" in predicted_df.columns:
                 _gemini_corrections = int(predicted_df["Rule_Corrected"].sum())
 
+        rag_result = None
         with st.spinner(
             "🔗 Running LangGraph workflow "
             "(parse → route → retrieve → cluster → synthesize → validate)..."
         ):
             try:
-                from src.ai.agent_graph import build_phase3_graph
-                app_graph = build_phase3_graph(
-                    vector_store=vector_store,
-                    gemini_caller=call_gemini_consultant,
-                    api_key=api_key,
-                    model_name=GEMINI_MODEL,
-                )
-            except Exception:
-                app_graph = None
-
-            if app_graph is not None:
-                from src.ai.agent_graph import GraphState as _GS
-                initial: _GS = {
-                    "query":                rag_query.strip(),
-                    "domain":               _gemini_domain,
-                    "language":             _gemini_language,
-                    "rule_corrected_count": _gemini_corrections,
-                    "top_k":                int(rag_top_k),
-                    "sentiment_filter":     "Negative",
-                    "parsed_query":         "",
-                    "effective_domain":     _gemini_domain,
-                    "retrieved":            [],
-                    "aspect_clusters":      {},
-                    "retry_count":          0,
-                    "step_log":             [],
-                    "report":               "",
-                    "validation_passed":    False,
-                    "validation_notes":     "",
-                    "error":                None,
-                }
-
-                # Try streaming node-by-node for live feedback
-                try:
-                    live_state: dict = dict(initial)
-                    for chunk in app_graph.stream(initial):
-                        # chunk is {node_name: state_dict}
-                        for node_name, node_state in chunk.items():
-                            live_state.update(node_state)
-                            log = live_state.get("step_log") or []
-                            step_label = log[-1] if log else node_name
-                            letter, label = STEP_LABELS.get(
-                                node_name, ("·", node_name)
-                            )
-                            status_area.info(
-                                f"⚙️ Step **{letter}** — {label}…"
-                            )
-                            _render_steps(log, step_label)
-                    rag_result = live_state
-                except Exception:
-                    # stream() not available in this version — fall back to invoke
-                    rag_result = app_graph.invoke(initial)
-
-            else:
-                # build failed — use convenience wrapper
-                rag_result = run_agentic_rag_p3(
+                rag_result = run_agentic_rag(
                     vector_store=vector_store,
                     gemini_caller=call_gemini_consultant,
                     api_key=api_key,
@@ -1670,11 +1617,11 @@ if trigger:
                     top_k=int(rag_top_k),
                     sentiment_filter="Negative",
                 )
-                except Exception as exc:
-                    import traceback
-                    traceback.print_exc()  # full trace ke Streamlit Cloud logs
-                    st.error(f"❌ LangGraph workflow failed: {exc}")
-                    rag_result = None
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                st.error(f"LangGraph workflow failed: {exc}")
+                rag_result = None
 
         if rag_result is not None:
             retrieved_docs = rag_result.get("retrieved", []) or []
@@ -1684,69 +1631,32 @@ if trigger:
             step_log = rag_result.get("step_log", []) or []
             loop_count = int(rag_result.get("loop_count", 0))
 
-            # ── Phase 3: Step-by-step LangGraph trace ──
-            workflow_label = (
-                "START → parse_query → route_domain → retrieve → "
-                "cluster_aspects → synthesize → validate → END"
-            )
-            if loop_count > 0:
-                workflow_label += f"  (with {loop_count} self-critique loop{'s' if loop_count > 1 else ''})"
-
             with st.expander(
                 f"🔗 LangGraph Trace — {len(retrieved_docs)} retrieved · "
                 f"{len(clusters)} aspects · {loop_count} loop(s)",
                 expanded=False,
             ):
-                st.markdown(f"**Workflow:** `{workflow_label}`")
                 st.markdown(
                     f"**Context** → Domain: **{_gemini_domain.title()}** · "
                     f"Language: **{_gemini_language}** · "
-                    f"Rule Corrections: **{_gemini_corrections}** · "
-                    f"Retries: **{retry_count}**"
+                    f"Rule Corrections: **{_gemini_corrections}**"
                 )
-
-                # Validation badge
                 if validation:
                     cov = float(validation.get("coverage_pct", 0.0)) * 100
                     is_valid = bool(validation.get("is_valid", False))
                     badge = (
-                        f"✅ **Validation passed** — {cov:.0f}% aspect coverage"
+                        f"✅ Validation passed — {cov:.0f}% coverage"
                         if is_valid
-                        else f"⚠️ **Validation incomplete** — {cov:.0f}% aspect coverage"
+                        else f"⚠️ Validation incomplete — {cov:.0f}% coverage"
                     )
                     st.markdown(badge)
-
                 st.markdown("---")
-                st.markdown("**🪜 Step-by-step execution log:**")
                 for i, step in enumerate(step_log, 1):
                     st.markdown(
                         f"`{i:02d}.` **{step.get('step', '')}** — "
                         f"{html.escape(str(step.get('info', '')))}"
                     )
 
-                # Cluster summary
-                if clusters:
-                    st.markdown("---")
-                    st.markdown("**🎯 Aspect Clusters (KMeans on retrieved reviews):**")
-                    for c in clusters:
-                        kw = ", ".join(c.get("keywords", [])[:5])
-                        st.markdown(
-                            f"- **Cluster #{c['cluster_id']}** "
-                            f"({c['size']} reviews) — keywords: `{kw}`"
-                        )
-
-                st.markdown("---")
-                st.markdown(
-                    f"**Retrieved reviews used for synthesis ({len(retrieved_docs)}):**"
-                )
-                for i, doc in enumerate(retrieved_docs, 1):
-                    score = float(doc.get("score", 0.0)) * 100.0
-                    text = html.escape(str(doc.get("text", "")))
-                    st.markdown(
-                        f"{i}. _{score:.1f}% match_ — {text}"
-                    )
-
-            # ── Final report ─────────────────────────────────────────────
             st.markdown("### 💼 Business Intelligence Report")
             st.markdown(report_md)
 

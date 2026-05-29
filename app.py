@@ -14,6 +14,7 @@ User-uploaded CSVs use dynamic, case-insensitive text column detection.
 
 from __future__ import annotations
 
+import csv
 import html
 import io
 import random
@@ -46,12 +47,30 @@ TARGET_COL = "Recommended IND"
 
 # Dynamic text column candidates for USER UPLOADS only (case-insensitive match).
 USER_TEXT_COLUMN_CANDIDATES = [
+    # English (most specific first — exact match priority)
     "review text",
+    "review_text",
+    "reviewtext",
+    "customer review",
     "review",
-    "text",
+    "reviews",
     "comment",
+    "comments",
+    "feedback",
+    "opinion",
+    "message",
     "content",
     "description",
+    "body",
+    "text",
+    # Indonesian
+    "ulasan",
+    "isi ulasan",
+    "komentar",
+    "tanggapan",
+    "pesan",
+    "deskripsi",
+    "isi",
 ]
 
 NEGATIVE_LABEL = 0  # not recommended
@@ -298,18 +317,171 @@ def find_text_column(df: pd.DataFrame) -> Optional[str]:
     """
     Locate a usable text column in a USER-UPLOADED CSV.
 
-    Strategy: case-insensitive match against USER_TEXT_COLUMN_CANDIDATES.
-    Returns the FIRST matched column (preserving its original casing in the
-    DataFrame). Returns None if no candidate is found.
+    Strategy (in order):
+      1. Exact case-insensitive match against USER_TEXT_COLUMN_CANDIDATES.
+      2. Substring match (e.g. "Customer Review Text" matches "review"),
+         but only if the column actually holds free text (avg length >= 10)
+         so we don't accidentally pick an ID column like "reviewer_id".
+
+    Returns the matched column (original casing) or None if nothing matches,
+    in which case the UI offers a manual picker.
     """
     # Build a map: lowercase column name -> original column name
     lower_to_original = {str(c).strip().lower(): c for c in df.columns}
 
+    # 1. Exact match (highest confidence)
     for candidate in USER_TEXT_COLUMN_CANDIDATES:
         if candidate in lower_to_original:
             return lower_to_original[candidate]
 
+    # 2. Substring match, guarded by average text length to avoid ID columns
+    for candidate in USER_TEXT_COLUMN_CANDIDATES:
+        for lower_name, original in lower_to_original.items():
+            if candidate in lower_name:
+                try:
+                    avg_len = float(
+                        df[original].dropna().astype(str).str.len().mean()
+                    )
+                except Exception:
+                    avg_len = 0.0
+                if avg_len >= 10:
+                    return original
+
     return None
+
+
+def guess_text_column(df: pd.DataFrame) -> Optional[str]:
+    """
+    Best-effort guess of which column holds free-text reviews: the column
+    whose values have the largest average character length. Used as the
+    pre-selected default in the manual column picker when auto-detect fails.
+    """
+    best_col: Optional[str] = None
+    best_len = 0.0
+    for col in df.columns:
+        try:
+            series = df[col].dropna().astype(str)
+            if len(series) == 0:
+                continue
+            avg_len = float(series.str.len().mean())
+        except Exception:
+            continue
+        if avg_len > best_len:
+            best_len, best_col = avg_len, col
+    return best_col
+
+
+def robust_read_csv(uploaded_file) -> Tuple[Optional[pd.DataFrame], dict]:
+    """
+    Read an uploaded CSV defensively, tolerating the most common real-world
+    issues so good files are not rejected over trivial formatting problems:
+
+      • Non-UTF-8 encodings (Excel/Windows exports are usually cp1252).
+        Decode is attempted as utf-8-sig → utf-8 → cp1252 → latin-1
+        (latin-1 can decode any byte, so it's the guaranteed final fallback).
+      • Alternate delimiters (comma / semicolon / tab / pipe) via csv.Sniffer,
+        with a count-based heuristic and a pandas auto-detect last resort.
+      • A few malformed rows — skipped (and counted) instead of aborting the
+        whole parse.
+
+    Returns:
+        (df, info) where info = {
+            "encoding": str | None,
+            "delimiter": str | None,
+            "rows_skipped": int,
+            "error": str | None,
+        }
+        df is None only when the file is genuinely unreadable.
+    """
+    info: dict = {
+        "encoding": None,
+        "delimiter": None,
+        "rows_skipped": 0,
+        "error": None,
+    }
+
+    # --- 1. Read raw bytes (reset pointer defensively) ---
+    try:
+        raw = uploaded_file.getvalue()
+    except Exception:
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+        raw = uploaded_file.read()
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", errors="replace")
+
+    # --- 2. Decode with a fallback chain (latin-1 never fails) ---
+    text: Optional[str] = None
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            info["encoding"] = enc
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if text is None:
+        text = raw.decode("latin-1", errors="replace")
+        info["encoding"] = "latin-1 (lossy)"
+
+    if not text.strip():
+        info["error"] = "File appears to be empty."
+        return None, info
+
+    # --- 3. Sniff the delimiter from a sample ---
+    sample = text[:8192]
+    delimiter = ","
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"])
+        delimiter = dialect.delimiter
+    except Exception:
+        first_line = next((ln for ln in sample.splitlines() if ln.strip()), "")
+        counts = {d: first_line.count(d) for d in (",", ";", "\t", "|")}
+        if max(counts.values(), default=0) > 0:
+            delimiter = max(counts, key=counts.get)
+    info["delimiter"] = {
+        ",": "comma", ";": "semicolon", "\t": "tab", "|": "pipe",
+    }.get(delimiter, repr(delimiter))
+
+    # --- 4. Parse, skipping malformed rows and counting them ---
+    skipped = {"n": 0}
+
+    def _count_bad(_bad_line):
+        skipped["n"] += 1
+        return None  # returning None tells pandas to skip the line
+
+    try:
+        df = pd.read_csv(
+            io.StringIO(text),
+            sep=delimiter,
+            engine="python",
+            on_bad_lines=_count_bad,
+        )
+    except Exception as exc_primary:
+        # Last resort: let pandas auto-detect the delimiter entirely.
+        try:
+            df = pd.read_csv(
+                io.StringIO(text),
+                sep=None,
+                engine="python",
+                on_bad_lines="skip",
+            )
+            info["delimiter"] = "auto"
+        except Exception as exc_fallback:  # noqa: F841
+            info["error"] = f"{type(exc_primary).__name__}: {exc_primary}"
+            return None, info
+
+    info["rows_skipped"] = skipped["n"]
+
+    # Drop fully-empty columns that some exports leave behind (e.g. trailing ",")
+    df = df.dropna(axis=1, how="all")
+
+    if df.shape[1] == 0 or len(df) == 0:
+        info["error"] = "No usable rows/columns after parsing."
+        return None, info
+
+    return df, info
 
 
 # ============================================================================
@@ -996,22 +1168,57 @@ user_text_col: Optional[str] = None
 vector_store: Optional[ReviewVectorStore] = None
 
 if uploaded_file is not None:
-    try:
-        uploaded_df = pd.read_csv(uploaded_file)
-    except Exception as exc:
-        st.error(f"Could not read CSV: {exc}")
-        uploaded_df = None
+    uploaded_df, _read_info = robust_read_csv(uploaded_file)
+    if uploaded_df is None:
+        st.error(
+            "⚠️ We couldn't read this CSV automatically. "
+            f"Details: {_read_info.get('error')}\n\n"
+            "Tips:\n"
+            "• Open it in Excel / Google Sheets and re-export as **CSV UTF-8**.\n"
+            "• Make sure the first row contains the column headers.\n"
+            "• Remove any title / notes rows placed above the header."
+        )
+    else:
+        # Surface how the file was parsed so the user can sanity-check it.
+        _enc = _read_info.get("encoding")
+        _delim = _read_info.get("delimiter")
+        _skipped = int(_read_info.get("rows_skipped", 0))
+        _msg = (
+            f"📄 Loaded **{len(uploaded_df):,} rows** · "
+            f"encoding `{_enc}` · delimiter `{_delim}`"
+        )
+        if _skipped > 0:
+            _msg += f" · ⚠️ skipped **{_skipped:,}** malformed line(s)"
+        st.caption(_msg)
 
 if uploaded_df is not None:
     user_text_col = find_text_column(uploaded_df)
 
     if user_text_col is None:
-        # CRITICAL: exact error message required by spec
-        st.error(
-            "Could not detect a text column. Ensure your CSV has a column "
-            "named 'Review Text', 'Review', 'Text', 'Comment', etc."
+        # Auto-detect failed — offer a friendly manual picker instead of
+        # rejecting the file outright. Pre-select our best guess so the user
+        # can simply confirm (or change) it.
+        _guess = guess_text_column(uploaded_df)
+        st.warning(
+            "🤔 Couldn't auto-detect the review/text column. Please pick the "
+            "column that holds the free-text reviews below "
+            "(we've pre-selected our best guess)."
         )
-    else:
+        _cols = list(uploaded_df.columns)
+        if _cols:
+            _default_idx = _cols.index(_guess) if _guess in _cols else 0
+            user_text_col = st.selectbox(
+                "📝 Select the text/review column to analyze:",
+                options=_cols,
+                index=_default_idx,
+                key="manual_text_col",
+                help=(
+                    "Pick the column containing free-text customer "
+                    "reviews/comments (not an ID, rating, or date column)."
+                ),
+            )
+
+    if user_text_col is not None:
         # ==================================================================
         # STEP 1: Auto-Routing — Detect domain & language via meta-classifier
         # ==================================================================

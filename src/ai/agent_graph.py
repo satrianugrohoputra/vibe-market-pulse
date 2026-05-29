@@ -147,7 +147,7 @@ def route_domain_node(state: GraphState) -> GraphState:
 
 
 # ============================================================================
-# Node 3 — retrieve (ChromaDB cosine search)  — factory, needs vector_store
+# Node 3 — retrieve (in-memory cosine search)  — factory, needs vector_store
 # ============================================================================
 def _make_retrieve_node(vector_store: Any) -> Callable[[GraphState], GraphState]:
     def retrieve_node(state: GraphState) -> GraphState:
@@ -531,7 +531,7 @@ def run_agentic_rag(
     Compile and execute the Phase 3 LangGraph workflow.
 
     Returns the final state dict containing:
-        - retrieved:    list[dict]      reviews returned by ChromaDB
+        - retrieved:    list[dict]      reviews returned by the vector store
         - clusters:     list[ClusterInfo] aspect clusters from KMeans
         - report:       str             final markdown report from Gemini
         - validation:   dict            coverage check result

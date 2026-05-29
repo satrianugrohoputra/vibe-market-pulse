@@ -1127,7 +1127,7 @@ if uploaded_df is not None:
         # ==================================================================
         # STEP 4: Build Vector Store for Semantic Search & RAG (Phase 1)
         # ==================================================================
-        # Detect optional rating column (for metadata filter in Chroma).
+        # Detect optional rating column (for metadata filter in the index).
         _rating_col_for_vs: Optional[str] = None
         for _c in predicted_df.columns:
             _name = str(_c).strip().lower()
@@ -1401,7 +1401,7 @@ if uploaded_df is not None:
             st.subheader("🧠 Smart Semantic Search")
             st.caption(
                 "Search by **meaning**, not keywords. Powered by multilingual "
-                "embeddings (sentence-transformers) + ChromaDB. "
+                "embeddings (sentence-transformers) + an in-memory cosine index. "
                 "100% local — no LLM calls, free forever."
             )
 

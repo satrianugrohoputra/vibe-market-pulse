@@ -39,7 +39,7 @@ from src.ai.agent_graph import run_agentic_rag
 # ----------------------------------------------------------------------------
 # Constants
 # ----------------------------------------------------------------------------
-BASE_DATASET_PATH = "ecommercereviews.csv"
+BASE_DATASET_PATH = "dataset/ecommercereviews.csv"
 
 # HARDCODED columns for the base training pipeline. Do NOT change these.
 TEXT_COL = "Review Text"
@@ -1033,7 +1033,7 @@ try:
 except FileNotFoundError:
     st.error(
         f"Base dataset `{BASE_DATASET_PATH}` not found. "
-        "Please place it in the project root."
+        "Please place it in the `dataset/` folder."
     )
     st.stop()
 except Exception as exc:

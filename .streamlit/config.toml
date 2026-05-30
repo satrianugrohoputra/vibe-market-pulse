@@ -1,0 +1,13 @@
+[server]
+# Maximum size (in MB) of a single uploaded file. Files larger than this are
+# rejected by Streamlit before reaching the app, protecting memory during the
+# embedding step. Lowered from the 200 MB default to 100 MB.
+maxUploadSize = 100
+
+[theme]
+# Light, indigo-accented theme to match the app's premium SaaS look.
+base = "light"
+primaryColor = "#4F46E5"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8F9FA"
+textColor = "#1F2937"
